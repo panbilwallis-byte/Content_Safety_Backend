@@ -292,6 +292,7 @@ def overview(from_: str = Query(alias="from"), to: str = Query(), scope: str = Q
 
 @router.get("/compliance/contexts")
 def contexts(source_kind: str, source_id: str | None = None, trace_id: str | None = None,
+             capture_id: str | None = None, model_version: str | None = None,
              db: Session = Depends(get_db)):
     ensure_compliance_data(db)
     candidates: list[dict] = []
@@ -328,10 +329,16 @@ def contexts(source_kind: str, source_id: str | None = None, trace_id: str | Non
                                "model_version": item.version, "capture_id": "CAPTURE-COMPLIANCE-001",
                                "label": f"{item.id} · {item.trace_id or '未记录 Trace'}"})
 
-    selected = [item for item in candidates if source_id is None or str(item["source_id"]) == str(source_id)]
+    selected = [item for item in candidates
+                if (source_id is None or str(item["source_id"]) == str(source_id))
+                and (capture_id is None or item["capture_id"] == capture_id)
+                and (model_version is None or item["model_version"] == model_version)]
+    # 未选择捕获记录时，模型激活审计优先使用已采集的默认候选。
+    if source_kind == "model" and selected:
+        selected = sorted(selected, key=lambda item: item["capture_id"] is None)[:1]
     empty = {"subject_ref": None, "task_id": None, "inference_id": None, "trace_id": None,
              "model_id": None, "model_version": None, "capture_id": None, "candidates": selected or candidates}
-    if source_id is None:
+    if source_id is None and source_kind != "model":
         return success(data={"resolution": "ambiguous" if candidates else "not_found", **empty})
     if not selected:
         return success(data={"resolution": "not_found", **empty, "candidates": []})
@@ -533,3 +540,5 @@ def alerts(page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100),
         detail = alert_payload(row)
         summaries.append({key: detail[key] for key in ("id", "display_id", "subject_ref", "description", "risk_level", "current_status", "stage")})
     return success(data=_page(summaries, page, page_size), message="风险告警查询成功")
+
+

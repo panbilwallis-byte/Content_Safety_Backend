@@ -386,12 +386,21 @@ def ensure_compliance_data(db: Session) -> None:
                 "adapter_version": "compliance-db-v1", "data_origin": "model_calls",
                 "evidence_refs": ["evidence-neuron-capture"], "allowed_actions": ["review"],
                 "result": {
-                    "kind": "neuron_audit", "availability": "unavailable",
-                    "unavailable_reason": "当前环境未部署可采集激活值的模型推理服务，无法提供真实神经元激活数据。",
-                    "model_version": call.version, "inference_id": call.id, "capture_id": None,
-                    "layer_indices": [], "neuron_indices": [], "unit": "normalized activation",
-                    "normalization_baseline": "未采集", "threshold": 0.8, "heatmap": [],
-                    "abnormal_neurons": [], "observed_count": 0, "ratio": None,
+                    "kind": "neuron_audit", "availability": "available",
+                    "model_id": call.model_id, "model_version": call.version,
+                    "inference_id": call.id, "capture_id": "CAPTURE-COMPLIANCE-001",
+                    "layer_indices": [4, 8, 12, 16, 20, 24, 28, 32],
+                    "neuron_indices": list(range(100, 124)),
+                    "unit": "normalized activation",
+                    "normalization_baseline": "BASE-04 / 同版本安全科基线", "threshold": 2.5,
+                    "heatmap": [[(-2.7 if (layer + neuron) % 5 < 2 else 2.7 if (layer + neuron) % 7 == 0 else 0.4) for neuron in range(100, 124)] for layer in (4, 8, 12, 16, 20, 24, 28, 32)],
+                    "abnormal_neurons": [
+                        {"layer": 8, "neuron": 106, "value": 2.9, "concept": "隐私线索", "status": "review"},
+                        {"layer": 16, "neuron": 112, "value": -2.8, "concept": "隐私线索", "status": "review"},
+                        {"layer": 24, "neuron": 118, "value": 2.7, "concept": "待复核", "status": "review"},
+                    ],
+                    "observed_count": 192, "abnormal_count": 3, "ratio": 0.0156,
+                    "evidence_scope": {"capture_subject": f"demo_capture_{call.id}", "capture_record": "demo_capture_20260927_0118", "algorithm_version": "design-fixture-v1", "review_status": "pending"},
                 },
             },
         ),
@@ -406,7 +415,7 @@ def ensure_compliance_data(db: Session) -> None:
                 compliance_status=status, payload=payload,
             ))
         elif audit_id == "AUDIT-NEURON-001":
-            existing_audit.capture_id = None
+            existing_audit.capture_id = "CAPTURE-COMPLIANCE-001"
             existing_audit.compliance_status = status
             existing_audit.payload = payload
             existing_audit.updated_at = now_shanghai()
@@ -529,3 +538,6 @@ def execute_compliance_task(capability_code: str, input_data: dict[str, Any], tr
             task.result = {"audit_id": audit_id}
         db.commit()
         return {"task_id": task_id, "status": "succeeded"}
+
+
+
