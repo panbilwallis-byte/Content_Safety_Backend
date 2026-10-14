@@ -1,0 +1,10 @@
+{
+  "capability_code": "semantic_risk",
+  "name": "诈骗文本风险识别",
+  "input": {
+    "content": "这是一个诈骗信息，请勿相信。"
+  },
+  "config": {
+    "threshold": 0.8
+  }
+}

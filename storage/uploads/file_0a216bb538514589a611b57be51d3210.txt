@@ -1,0 +1,31 @@
+ Error calling tool 'query_memory_metrics'                                                                                                                       
+                    ╭───────────────────────────────────────────────────────────── Traceback (most recent call last) ──────────────────────────────────────────────────────────────╮
+                    │ E:\pycharmproject\super_biz_agent_py\.venv\Lib\site-packages\fastmcp\server\server.py:1282 in call_tool                                                      │
+                    │                                                                                                                                                              │
+                    │ E:\pycharmproject\super_biz_agent_py\.venv\Lib\site-packages\fastmcp\tools\base.py:392 in _run                                                               │
+                    │                                                                                                                                                              │
+                    │                                                                   ... 6 frames hidden ...                                                                    │
+                    │                                                                                                                                                              │
+                    │ E:\pycharmproject\super_biz_agent_py\mcp_servers\monitor_server.py:53 in wrapper                                                                             │
+                    │                                                                                                                                                              │
+                    │    50 │   │                                                                                                                                                  │
+                    │    51 │   │   # 执行方法                                                                                                                                     │
+                    │    52 │   │   try:                                                                                                                                           │
+                    │ ❱  53 │   │   │   result = func(*args, **kwargs)                                                                                                             │
+                    │    54 │   │   │                                                                                                                                              │
+                    │    55 │   │   │   # 记录返回状态                                                                                                                             │
+                    │    56 │   │   │   logger.info(f"返回状态: SUCCESS")                                                                                                          │
+                    │                                                                                                                                                              │
+                    │ E:\pycharmproject\super_biz_agent_py\mcp_servers\monitor_server.py:394 in query_memory_metrics                                                               │
+                    │                                                                                                                                                              │
+                    │   391 │                                                                                                                                                      │
+                    │   392 │   # 计算统计信息                                                                                                                                     │
+                    │   393 │   if data_points:                                                                                                                                    │
+                    │ ❱ 394 │   │   values = [d["value"] for d in data_points]                                                                                                     │
+                    │   395 │   │   avg_value = round(sum(values) / len(values), 2)                                                                                                │
+                    │   396 │   │   max_value = max(values)                                                                                                                        │
+                    │   397 │   │   min_value = min(values)                                                                                                                        │
+                    ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+                    MemoryError                                                                                                                                                     
+memory allocation of 1048576 bytes failed
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

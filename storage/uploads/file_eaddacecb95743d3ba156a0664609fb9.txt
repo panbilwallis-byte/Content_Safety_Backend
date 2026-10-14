@@ -1,0 +1,4 @@
+docker命令
+镜像 docker images  查看电脑里面镜像   docker  rmi 删除镜像   docker build -t  +名字：tag 根据dockerfile文件创建镜像
+容器命令  docker run 根据镜像创建并运行容器  docker tag  创建镜像别名  docker  rm 删除镜像 attach命令将终端的stdin,stdout,errstream绑定到正在运行容器的主进程，docker attach  +容器 ，所以在当前终端进行操作就是对容器主进程进行操作。exec命令在容器中运行命令，不是主进程。docker  exec +容器名字 +命令，不是在主进程运行，所以在执行exit命令不会退出容器，但是attach以后就会退出容器。容器的生命周期
+由于虚拟机
