@@ -333,8 +333,9 @@ def contexts(source_kind: str, source_id: str | None = None, trace_id: str | Non
                 if (source_id is None or str(item["source_id"]) == str(source_id))
                 and (capture_id is None or item["capture_id"] == capture_id)
                 and (model_version is None or item["model_version"] == model_version)]
-    # 未选择捕获记录时，模型激活审计优先使用已采集的默认候选。
-    if source_kind == "model" and selected:
+    # 仅在已指定具体模型、但未选择捕获记录时，才自动挑一条"已采集激活"的默认候选；
+    # 未指定模型时必须返回全量候选，供谱系页与内部审计的对象下拉框使用。
+    if source_kind == "model" and selected and source_id is not None:
         selected = sorted(selected, key=lambda item: item["capture_id"] is None)[:1]
     empty = {"subject_ref": None, "task_id": None, "inference_id": None, "trace_id": None,
              "model_id": None, "model_version": None, "capture_id": None, "candidates": selected or candidates}
