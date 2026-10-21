@@ -8,7 +8,7 @@ from sqlalchemy import select
 from app.core.database import SessionLocal
 from app.core.response import success
 from app.core.time import now_shanghai
-from app.domain.schemas import RegisterModelServiceRequest
+from app.domain.schemas import RegisterModelServiceRequest, UpgradeModelServiceRequest
 from app.models.tables import Dataset, Model, ModelVersion, ModelService, ModelCall, TrainingTask, Task
 from app.routers.training_tasks import advance_training_task, training_task_payload
 
@@ -142,7 +142,7 @@ def current_model_workbench():
         for version in versions:
             version_map.setdefault(version.model_id, []).append(version)
         now = now_shanghai()
-        if any(advance_training_task(task, now) for task in training_tasks):
+        if any(advance_training_task(db, task, now) for task in training_tasks):
             db.commit()
         datasets = list(db.scalars(select(Dataset).order_by(Dataset.id.desc())).all())
         assessments = list(db.scalars(select(Task).where(Task.capability_code == "evaluation").order_by(Task.created_at.desc())).all())
@@ -211,11 +211,16 @@ def register_model_service(request: RegisterModelServiceRequest):
         duplicate = db.scalar(select(ModelService).where(ModelService.name == request.name))
         if duplicate:
             raise HTTPException(status_code=409, detail="服务名称已存在")
+        # 同一地址允许承载同一模型的不同版本（灰度/回滚），但同一模型版本不得重复登记。
         endpoint_in_use = db.scalar(
-            select(ModelService).where(ModelService.endpoint == request.endpoint)
+            select(ModelService).where(
+                ModelService.endpoint == request.endpoint,
+                ModelService.model_id == str(model_id),
+                ModelService.version == request.version,
+            )
         )
         if endpoint_in_use:
-            raise HTTPException(status_code=409, detail="服务地址已被登记")
+            raise HTTPException(status_code=409, detail="该模型的这个版本已登记过相同地址的服务")
 
         service = ModelService(
             id=f"SVC-{uuid4().hex[:8]}",
@@ -233,6 +238,86 @@ def register_model_service(request: RegisterModelServiceRequest):
         db.commit()
         db.refresh(service)
         return success(data=_service_payload(service), message="推理服务已登记，等待连接检查")
+
+
+@router.patch("/model-services/{service_id}")
+def upgrade_model_service(service_id: str, request: UpgradeModelServiceRequest):
+    """把服务重绑到该模型的另一个已登记版本；升级后回到「已部署·待检查」。"""
+    with SessionLocal() as db:
+        service = db.get(ModelService, service_id)
+        if service is None:
+            raise HTTPException(status_code=404, detail="推理服务不存在")
+        try:
+            model_id = int(service.model_id)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422, detail="服务绑定的模型 ID 非法") from None
+        model = db.get(Model, model_id)
+        if model is None:
+            raise HTTPException(status_code=404, detail="绑定模型不存在")
+        versions = db.scalars(
+            select(ModelVersion).where(ModelVersion.model_id == model_id)
+        ).all()
+        if request.version not in {item.version for item in versions} | {model.version}:
+            raise HTTPException(status_code=422, detail="绑定模型不存在该版本")
+        if request.version == service.version:
+            raise HTTPException(status_code=400, detail="服务已经绑定该版本")
+        conflict = db.scalar(
+            select(ModelService).where(
+                ModelService.endpoint == service.endpoint,
+                ModelService.model_id == service.model_id,
+                ModelService.version == request.version,
+                ModelService.id != service_id,
+            )
+        )
+        if conflict:
+            raise HTTPException(
+                status_code=409,
+                detail=f"同地址下已存在该模型版本的服务「{conflict.name}」，无法切换",
+            )
+        service.version = request.version
+        service.status = "deployed"
+        service.checked_at = None
+        service.latency_ms = None
+        service.healthy = None
+        db.commit()
+        db.refresh(service)
+        return success(
+            data=_service_payload(service),
+            message=f"服务已切换到版本 {request.version}，等待连接检查",
+        )
+
+
+@router.post("/model-services/{service_id}/stop")
+def stop_model_service(service_id: str):
+    """停止运行中的服务；停止后模型调用页不再可选，重新检查连接即恢复。"""
+    with SessionLocal() as db:
+        service = db.get(ModelService, service_id)
+        if service is None:
+            raise HTTPException(status_code=404, detail="推理服务不存在")
+        if service.status != "running":
+            raise HTTPException(status_code=400, detail="只有运行中的服务可以停止")
+        service.status = "offline"
+        service.checked_at = None
+        service.latency_ms = None
+        service.healthy = None
+        db.commit()
+        db.refresh(service)
+        return success(data=_service_payload(service), message="服务已停止")
+
+
+@router.delete("/model-services/{service_id}")
+def delete_model_service(service_id: str):
+    """删除服务登记；运行中的服务须先停止，历史调用记录（model_calls）保留。"""
+    with SessionLocal() as db:
+        service = db.get(ModelService, service_id)
+        if service is None:
+            raise HTTPException(status_code=404, detail="推理服务不存在")
+        if service.status == "running":
+            raise HTTPException(status_code=400, detail="服务正在运行，请先停止后再删除")
+        name = service.name
+        db.delete(service)
+        db.commit()
+        return success(data={"id": service_id, "name": name}, message=f"服务「{name}」已删除")
 
 
 @router.post("/model-services/{service_id}/check")

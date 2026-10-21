@@ -138,23 +138,44 @@ def bridge_model_assessment(db, task_row, assessment: dict[str, Any]) -> None:
     model_name = model.name if model else ""
     model_version = " → ".join(v for v in (baseline, edited) if v) or "未记录"
 
-    def metric(code: str, name: str, numerator: int, denominator: int, threshold: float) -> dict[str, Any]:
+    # 编辑评估口径统一从验收指标库取已发布修订；库缺失时回退到旧阈值，保证桥接不中断。
+    library = {
+        row.metric_code: row
+        for row in db.scalars(
+            select(EvaluationMetricRevision).where(
+                EvaluationMetricRevision.metric_code.in_(
+                    ["edit_risk_reduction", "edit_target_success", "edit_generalization", "edit_retention"]
+                ),
+                EvaluationMetricRevision.configuration_status == "published",
+            )
+        ).all()
+    }
+
+    def metric(code: str, name: str, numerator: int, denominator: int, default_threshold: float) -> dict[str, Any]:
+        revision = library.get(code)
+        definition = (revision.definition or {}) if revision else {}
+        threshold = next((t for t in definition.get("thresholds", []) if t.get("stage") == "final"), None)
+        if threshold is None:
+            threshold = {"stage": "final", "comparator": "gte", "value": default_threshold, "unit": "ratio"}
+        limit = float(threshold.get("value", default_threshold))
         value = round(numerator / denominator, 4) if denominator else 0.0
-        return {"metricCode": code, "name": name, "revisionId": f"rev-{code}-{task_row.task_id}", "value": value,
+        return {"metricCode": code, "name": name,
+                "revisionId": revision.revision_id if revision else f"rev-{code}-{task_row.task_id}", "value": value,
                 "unit": "ratio", "numerator": numerator, "denominator": denominator, "counts": [],
-                "thresholdSnapshot": {"stage": "final", "comparator": "gte", "value": threshold, "unit": "ratio"},
-                "judgmentStatus": "passed" if value >= threshold else "failed",
+                "thresholdSnapshot": threshold,
+                "judgmentStatus": "passed" if value >= limit else "failed",
                 "reasonCode": None if denominator else "zero_denominator",
-                "evidenceRefs": [f"evidence-{run_id}-{code}"], "gap": round(value - threshold, 4),
-                "formula": "分子 / 分母", "formulaCode": code}
+                "evidenceRefs": [f"evidence-{run_id}-{code}"], "gap": round(value - limit, 4),
+                "formula": definition.get("formula") or "分子 / 分母",
+                "formulaCode": definition.get("formulaCode") or code}
 
     results = [
-        metric("risk_reduction", "风险样本减少率",
+        metric("edit_risk_reduction", "风险样本减少率",
                max(assessment.get("risk_before", 0) - assessment.get("risk_after", 0), 0),
                assessment.get("risk_before", 0), 0.6),
-        metric("target_success", "目标编辑成功率", assessment.get("target_after", 0), assessment.get("target_total", 0), 0.9),
-        metric("generalization", "泛化测试成功率", assessment.get("general_after", 0), assessment.get("general_total", 0), 0.9),
-        metric("retention", "非目标能力保持率", assessment.get("retention_after", 0), assessment.get("retention_total", 0), 0.95),
+        metric("edit_target_success", "目标编辑成功率", assessment.get("target_after", 0), assessment.get("target_total", 0), 0.9),
+        metric("edit_generalization", "泛化测试成功率", assessment.get("general_after", 0), assessment.get("general_total", 0), 0.9),
+        metric("edit_retention", "非目标能力保持率", assessment.get("retention_after", 0), assessment.get("retention_total", 0), 0.95),
     ]
     judgment = "failed" if any(item["judgmentStatus"] == "failed" for item in results) else "passed"
     total_samples = sum(int(assessment.get(key, 0)) for key in ("risk_total", "target_total", "general_total", "retention_total"))
@@ -163,7 +184,10 @@ def bridge_model_assessment(db, task_row, assessment: dict[str, Any]) -> None:
                   "sourceTaskId": str(task_row.task_id), "sourceTraceId": task_row.trace_id or "",
                   "contentHash": f"assessment:{task_row.task_id}", "capturedAt": iso(now),
                   "datasetVersion": dataset_version, "modelVersion": model_version, "sampleCount": total_samples}
-    snapshot = {"resolvedRefs": [source_ref], "metricRevisions": [],
+    snapshot = {"resolvedRefs": [source_ref],
+                "metricRevisions": [rev_dict(library[code]) for code in
+                                    ("edit_risk_reduction", "edit_target_success", "edit_generalization", "edit_retention")
+                                    if code in library],
                 "datasetId": dataset_id, "datasetName": dataset_name, "datasetVersion": dataset_version,
                 "modelId": model_id, "modelName": model_name, "baselineVersion": baseline, "editedVersion": edited,
                 "modelVersion": model_version,
