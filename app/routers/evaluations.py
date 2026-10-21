@@ -215,8 +215,11 @@ def publish_revision(metric_id: str, revision_id: str, payload: dict[str, Any]):
 def tasks(keyword:str|None=None,status:str|None=None,stage:str|None=None,page:int=1,page_size:int=10):
     with SessionLocal() as db:
         ensure_demo_runs(db)
-        rows=db.scalars(select(EvaluationTask).order_by(EvaluationTask.created_at.desc())).all(); rows=[t for t in rows if (not keyword or keyword.lower() in t.name.lower()) and (not status or t.status==status) and (not stage or t.target_stage==stage)]
-        total=len(rows); return success({"items":[task_dict(t) for t in rows[(page-1)*page_size:page*page_size]],"total":total,"page":page,"pageSize":page_size,"totalPages":(total+page_size-1)//page_size,"summary":[{"name":s,"value":sum(t.status==s for t in rows)} for s in ["pending","running","failed"]]})
+        all_rows=db.scalars(select(EvaluationTask).order_by(EvaluationTask.created_at.desc())).all()
+        # 状态卡的计数只跟随搜索词与阶段变化，不受"状态"本身筛选影响，否则点任一状态卡都会把另外两张清零。
+        scoped=[t for t in all_rows if (not keyword or keyword.lower() in t.name.lower()) and (not stage or t.target_stage==stage)]
+        rows=[t for t in scoped if not status or t.status==status]
+        total=len(rows); return success({"items":[task_dict(t) for t in rows[(page-1)*page_size:page*page_size]],"total":total,"page":page,"pageSize":page_size,"totalPages":(total+page_size-1)//page_size,"summary":[{"name":s,"value":sum(t.status==s for t in scoped)} for s in ["pending","running","failed"]]})
 @router.get("/tasks/{task_id}")
 def task(task_id:str):
     with SessionLocal() as db:
