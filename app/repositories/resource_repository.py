@@ -181,6 +181,8 @@ def resource_to_dict(resource) -> dict[str, Any]:
         "storage_gb": float(metadata.get("storage_gb", 0) or 0),
         "quality_score": float(metadata.get("quality_score", 0) or 0),
         "quality_status": metadata.get("quality_status", "good"),
+        # 数据集用途（training/evaluation）：模型训练与模型评估的下拉按此筛选。
+        "purpose": metadata.get("purpose", "training"),
         "owner": metadata.get("owner", "平台管理员"),
         "created_at": (
             resource.created_at.isoformat()

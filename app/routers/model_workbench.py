@@ -180,8 +180,9 @@ def current_model_workbench():
                 {
                     "id": str(dataset.id), "name": dataset.name, "version": dataset.version,
                     "row_count": int((dataset.metadata_json or {}).get("record_count", 0) or 0),
-                    # 训练弹窗按 purpose=training 筛选；这些数据库数据集均可作为训练输入。
-                    "purpose": "training",
+                    # 训练弹窗按 purpose=training 筛选、评估页按 purpose=evaluation 筛选；
+                    # 用途存在 metadata_json.purpose，缺省视为训练集。
+                    "purpose": (dataset.metadata_json or {}).get("purpose", "training"),
                 }
                 for dataset in datasets
             ],

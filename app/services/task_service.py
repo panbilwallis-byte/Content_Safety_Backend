@@ -494,6 +494,13 @@ def run_mock_task(
                     result=result,
                     db=db,
                 )
+
+                # 模型评估结果同步导入测试评估工作区，保证「查看测试记录」深链可解析。
+                if result.get("model_assessment"):
+                    from app.models.tables import Task
+                    from app.routers.evaluations import bridge_model_assessment
+
+                    bridge_model_assessment(db, db.get(Task, task_id), result["model_assessment"])
              # 计算任务执行耗时
             duration_ms = int(
                 (perf_counter() - started_at) * 1000
