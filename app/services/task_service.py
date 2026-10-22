@@ -4,8 +4,9 @@ from random import uniform
 from pathlib import Path
 from app.adapters.mock_adapter import execute_mock_capability
 from app.core.database import SessionLocal
+from sqlalchemy import select
 from sqlalchemy.orm import Session
-from app.models.tables import Dataset, ModelCall, ModelService
+from app.models.tables import Dataset, Model, ModelCall, ModelService, ModelVersion
 from app.core.time import now_shanghai
 from app.domain.capabilities import is_supported
 from app.domain.schemas import ExecuteTaskRequest
@@ -18,8 +19,6 @@ from app.repositories.resource_repository import (
 from app.repositories.task_repository import save, update
 from app.services.resource_display import (
     normalize_source_name,
-    task_dataset_default,
-    task_display_defaults,
     task_ingest_statistics,
     task_version_default,
 )
@@ -27,6 +26,33 @@ from app.services.database_ingest import read_mysql_rows, save_dataset_rows
 from app.services.file_ingest import read_uploaded_file_rows
 
 MAX_LOCAL_FILE_STORAGE_GB = 2.0
+
+
+def register_edited_version(db: Session, task_id: str, input_data: dict, config: dict) -> tuple[str, str]:
+    """知识编辑成功后把“编辑后版本”登记进 model_versions，评估页下拉框才会真的多出可对比的版本。
+    命名沿用 {基线}-edit；只登记产物，不移动模型当前版本指针——编辑版本是评估用的支线。"""
+    try:
+        model = db.get(Model, int(input_data.get("model_id") or input_data.get("modelId")))
+    except (TypeError, ValueError):
+        return "", ""
+    if model is None:
+        return "", ""
+    baseline = str(config.get("model_version") or config.get("modelVersion") or "").strip() or model.version
+    edited = f"{baseline}-edit"
+    exists = db.scalar(
+        select(ModelVersion).where(
+            ModelVersion.model_id == model.id,
+            ModelVersion.version == edited,
+        )
+    )
+    if exists is None:
+        db.add(ModelVersion(
+            model_id=model.id,
+            version=edited,
+            description=f"由知识编辑任务（{task_id}）产出",
+            task_id=task_id,
+        ))
+    return baseline, edited
 
 
 def _safe_ingest_input(input_data: dict) -> dict:
@@ -196,7 +222,7 @@ def run_mock_task(
             "数据源",
         )
     else:
-        default_source_name, _ = task_display_defaults(task_id)
+        # 非接入任务没有数据源这一语义，不得编造来源；空值由展示层兜底为“未填写来源”。
         source_name = normalize_source_name(
             input_data.get("source_name")
             or input_data.get("sourceName")
@@ -204,17 +230,16 @@ def run_mock_task(
             or input_data.get("sourceAddress")
             or input_data.get("connector_type")
             or input_data.get("connectorType")
-        ) or default_source_name
+        )
 
     dataset_name = (
         input_data.get("dataset_name")
         or input_data.get("datasetName")
         or dataset_name
-        or task_dataset_default(task_id)
     )
 
-    # 除非调用方明确传入数据量，否则每个新任务使用自身的随机展示容量；
-    # 不能直接复用目标数据集的总容量，否则连续新建任务会出现相同数值。
+    # 数据量只在接入任务里按来源计算；其他任务没有这一语义，只有调用方
+    # 显式传入才记录，不再生成随机展示容量（如模型调用页输出的 txt）。
     explicit_storage_gb = input_data.get("storage_gb") or input_data.get("storageGb")
     if is_ingest:
         uploaded_size_bytes = _uploaded_size_bytes(input_data.get("files"))
@@ -229,8 +254,7 @@ def run_mock_task(
         ) == "本地文件":
             raise ValueError("本地文件单次接入不能超过 2GB")
     else:
-        _, default_storage_gb = task_display_defaults(task_id)
-        storage_gb = float(explicit_storage_gb or default_storage_gb)
+        storage_gb = float(explicit_storage_gb or 0)
 
     # 关联模型
     model_id = request.input.get("model_id")
@@ -544,15 +568,20 @@ def run_mock_task(
                 if not isinstance(original_output, str) or not isinstance(governed_output, str):
                     raise ValueError("模型服务未返回完整治理结果")
 
+                # 本次调用实际跑在哪个服务版本上，调用记录与任务流水必须写同一个值；
+                # 否则 tasks.model_version（模型档案版本）会与 model_calls.version 对不上。
+                call_version = (
+                    request.config.get("model_version")
+                    or request.config.get("modelVersion")
+                    or service.version
+                )
+                model_version = call_version
+
                 db.add(ModelCall(
                     id=task_id,
                     model_id=str(requested_model_id),
                     service_id=service.id,
-                    version=(
-                        request.config.get("model_version")
-                        or request.config.get("modelVersion")
-                        or service.version
-                    ),
+                    version=call_version,
                     prompt=prompt.strip(),
                     original_output=original_output,
                     governed_output=governed_output,
@@ -565,6 +594,14 @@ def run_mock_task(
                     created_at=now_shanghai(),
                 ))
 
+            # 风险知识编辑成功后登记真实的编辑后版本，并把结果里的版本字段改为实际值，
+            # 替换模拟适配器写死的 v1.0.0/v1.0.1，保证任务流水与 model_versions 对得上。
+            if request.capability_code == "knowledge_edit" and status == "succeeded":
+                edit_baseline, edit_edited = register_edited_version(db, task_id, input_data, request.config)
+                if edit_edited:
+                    result["before_version"] = edit_baseline
+                    result["after_version"] = edit_edited
+
             # 更新任务结果
             finished_task = update(
                 task_id,
@@ -572,6 +609,7 @@ def run_mock_task(
                     "status": status,
                     "dataset_name": dataset_name,
                     "storage_gb": storage_gb,
+                    "model_version": model_version,
                     "result": result,
                     "finished_at": now_utc(),
 
