@@ -133,17 +133,23 @@ def _model_payload(model: Model, versions: list[ModelVersion]) -> dict:
 def current_model_workbench():
     """模型训推页面的数据库聚合读取接口。"""
     with SessionLocal() as db:
+        # 先推进训练再读取模型与版本：训练到点会登记新版本，
+        # 若先查再推进，完成当次响应会缺少刚写入的版本记录。
+        training_tasks = list(db.scalars(select(TrainingTask).order_by(TrainingTask.updated_at.desc())).all())
+        now = now_shanghai()
+        advanced = False
+        for task in training_tasks:
+            if advance_training_task(db, task, now):
+                advanced = True
+        if advanced:
+            db.commit()
         models = list(db.scalars(select(Model).order_by(Model.updated_at.desc())).all())
         versions = list(db.scalars(select(ModelVersion).order_by(ModelVersion.created_at.desc())).all())
-        training_tasks = list(db.scalars(select(TrainingTask).order_by(TrainingTask.updated_at.desc())).all())
         services = list(db.scalars(select(ModelService)).all())
         calls = list(db.scalars(select(ModelCall).order_by(ModelCall.created_at.desc())).all())
         version_map: dict[int, list[ModelVersion]] = {}
         for version in versions:
             version_map.setdefault(version.model_id, []).append(version)
-        now = now_shanghai()
-        if any(advance_training_task(db, task, now) for task in training_tasks):
-            db.commit()
         datasets = list(db.scalars(select(Dataset).order_by(Dataset.id.desc())).all())
         assessments = list(db.scalars(select(Task).where(Task.capability_code == "evaluation").order_by(Task.created_at.desc())).all())
         edit_tasks = list(db.scalars(select(Task).where(Task.capability_code == "knowledge_edit").order_by(Task.created_at.desc())).all())
