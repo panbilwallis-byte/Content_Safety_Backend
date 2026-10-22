@@ -639,27 +639,6 @@ def ensure_process_demo_tasks():
         db.commit()
 
 
-def ensure_model_evaluation_versions():
-    """为每个模型补充一个可供模型评估页选择的编辑后版本。"""
-    with SessionLocal() as db:
-        for model in db.scalars(select(Model)).all():
-            version = f"{model.version}-edit"
-            exists = db.scalar(
-                select(ModelVersion).where(
-                    ModelVersion.model_id == model.id,
-                    ModelVersion.version == version,
-                )
-            )
-            if exists is None:
-                db.add(ModelVersion(
-                    model_id=model.id,
-                    version=version,
-                    description="后端模拟知识编辑后的评估版本",
-                    task_id=f"seed-model-edit-{model.id}",
-                ))
-        db.commit()
-
-
 def seed_initial_data():
     """
     第一次启动时写入演示数据。

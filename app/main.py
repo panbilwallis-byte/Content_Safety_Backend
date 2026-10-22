@@ -30,7 +30,6 @@ from app.core.seed import (
     ensure_resource_display_values,
     ensure_ingest_demo_tasks,
     ensure_process_demo_tasks,
-    ensure_model_evaluation_versions,
     ensure_evaluation_metrics,
     ensure_evaluation_tasks,
     normalize_evaluation_display_values,
@@ -91,7 +90,6 @@ async def lifespan(app: FastAPI):
     ensure_resource_display_values()
     ensure_ingest_demo_tasks()
     ensure_process_demo_tasks()
-    ensure_model_evaluation_versions()
     ensure_demo_evaluations()
     seed_compliance_data()
     # 演示训练成功后必须能在模型管理页看到产物版本；补登历史成功任务。

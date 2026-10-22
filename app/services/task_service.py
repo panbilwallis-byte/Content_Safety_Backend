@@ -4,8 +4,9 @@ from random import uniform
 from pathlib import Path
 from app.adapters.mock_adapter import execute_mock_capability
 from app.core.database import SessionLocal
+from sqlalchemy import select
 from sqlalchemy.orm import Session
-from app.models.tables import Dataset, ModelCall, ModelService
+from app.models.tables import Dataset, Model, ModelCall, ModelService, ModelVersion
 from app.core.time import now_shanghai
 from app.domain.capabilities import is_supported
 from app.domain.schemas import ExecuteTaskRequest
@@ -25,6 +26,33 @@ from app.services.database_ingest import read_mysql_rows, save_dataset_rows
 from app.services.file_ingest import read_uploaded_file_rows
 
 MAX_LOCAL_FILE_STORAGE_GB = 2.0
+
+
+def register_edited_version(db: Session, task_id: str, input_data: dict, config: dict) -> tuple[str, str]:
+    """知识编辑成功后把“编辑后版本”登记进 model_versions，评估页下拉框才会真的多出可对比的版本。
+    命名沿用 {基线}-edit；只登记产物，不移动模型当前版本指针——编辑版本是评估用的支线。"""
+    try:
+        model = db.get(Model, int(input_data.get("model_id") or input_data.get("modelId")))
+    except (TypeError, ValueError):
+        return "", ""
+    if model is None:
+        return "", ""
+    baseline = str(config.get("model_version") or config.get("modelVersion") or "").strip() or model.version
+    edited = f"{baseline}-edit"
+    exists = db.scalar(
+        select(ModelVersion).where(
+            ModelVersion.model_id == model.id,
+            ModelVersion.version == edited,
+        )
+    )
+    if exists is None:
+        db.add(ModelVersion(
+            model_id=model.id,
+            version=edited,
+            description=f"由知识编辑任务（{task_id}）产出",
+            task_id=task_id,
+        ))
+    return baseline, edited
 
 
 def _safe_ingest_input(input_data: dict) -> dict:
@@ -565,6 +593,14 @@ def run_mock_task(
                     trace_id=trace_id,
                     created_at=now_shanghai(),
                 ))
+
+            # 风险知识编辑成功后登记真实的编辑后版本，并把结果里的版本字段改为实际值，
+            # 替换模拟适配器写死的 v1.0.0/v1.0.1，保证任务流水与 model_versions 对得上。
+            if request.capability_code == "knowledge_edit" and status == "succeeded":
+                edit_baseline, edit_edited = register_edited_version(db, task_id, input_data, request.config)
+                if edit_edited:
+                    result["before_version"] = edit_baseline
+                    result["after_version"] = edit_edited
 
             # 更新任务结果
             finished_task = update(
