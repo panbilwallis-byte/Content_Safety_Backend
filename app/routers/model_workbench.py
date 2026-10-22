@@ -106,7 +106,22 @@ def _assessment_for_edit_task(
     }
 
 
-def _model_payload(model: Model, versions: list[ModelVersion]) -> dict:
+def _model_payload(model: Model, versions: list[ModelVersion], edit_task_map: dict[str, Task] | None = None) -> dict:
+    task_map = edit_task_map or {}
+
+    def version_payload(item: ModelVersion) -> dict:
+        # 编辑产物行携带产出它的编辑任务信息，评估页选中某轮编辑版本时
+        # 左侧“风险知识编辑”卡片据此展示该轮编辑的知识内容。
+        edit_task = task_map.get(item.task_id or "")
+        return {
+            "version": item.version,
+            "created_at": item.created_at.isoformat(),
+            "description": item.description,
+            "task_id": item.task_id,
+            "edit_knowledge": (edit_task.input_data or {}).get("target_knowledge") if edit_task else None,
+            "edit_status": edit_task.status if edit_task else None,
+        }
+
     return {
         "id": model.id,
         "name": model.name,
@@ -117,15 +132,7 @@ def _model_payload(model: Model, versions: list[ModelVersion]) -> dict:
         "creator": model.creator or "系统管理员",
         "updated_at": model.updated_at.isoformat() if model.updated_at else model.created_at.isoformat(),
         "dataset": (model.metadata_json or {}).get("dataset"),
-        "versions": [
-            {
-                "version": item.version,
-                "created_at": item.created_at.isoformat(),
-                "description": item.description,
-                "task_id": item.task_id,
-            }
-            for item in versions
-        ],
+        "versions": [version_payload(item) for item in versions],
     }
 
 
@@ -177,7 +184,7 @@ def current_model_workbench():
             )
     return success(
         data={
-            "models": [_model_payload(model, version_map.get(model.id, [])) for model in models],
+            "models": [_model_payload(model, version_map.get(model.id, []), {task.task_id: task for task in edit_tasks}) for model in models],
             "training": [training_task_payload(task) for task in training_tasks],
             "services": [_service_payload(service) for service in services],
             "calls": [{"id": c.id, "model_id": c.model_id, "service_id": c.service_id, "version": c.version, "prompt": c.prompt, "original_output": c.original_output, "governed_output": c.governed_output, "reason": c.reason, "risk_level": c.risk_level, "reconstruction": c.reconstruction, "elapsed_ms": c.elapsed_ms, "created_at": c.created_at.isoformat(), "status": c.status, "trace_id": c.trace_id} for c in calls],
@@ -208,20 +215,29 @@ def model_workbench_assessment(
     """返回指定“模型+基线+编辑后+测试集”组合的最新评估结果。
 
     聚合接口只携带全局最新一条评估，切换测试集再切回来时旧结果看似被覆盖；
-    本接口按五要素回查历史任务。若该模型在评估之后又发生了成功的编辑任务，
-    旧评估视为过期，与聚合接口的 assessmentStale 口径一致。"""
+    本接口按五要素回查历史任务。多轮编辑方案下每轮编辑产物是固定版本，
+    新一轮编辑不会作废旧轮的评估，各组合各自保留最新结果。
+    但评估必须晚于产出该版本号的编辑任务：版本号可能被复用（旧产物行被删后
+    重新编辑），此时早于新编辑的旧评估不得匹配到新产物上。"""
     with SessionLocal() as db:
+        edit_created = None
+        model_pk = int(model_id) if model_id.isdigit() else None
+        if model_pk is not None:
+            version_row = db.scalar(
+                select(ModelVersion).where(
+                    ModelVersion.model_id == model_pk,
+                    ModelVersion.version == edited,
+                )
+            )
+            producing = db.get(Task, version_row.task_id) if version_row and version_row.task_id else None
+            edit_created = producing.created_at if producing else None
         rows = db.scalars(
             select(Task)
-            .where(Task.capability_code.in_(("evaluation", "knowledge_edit")))
+            .where(Task.capability_code == "evaluation")
             .order_by(Task.created_at.desc(), Task.task_id.desc())
         ).all()
     for task in rows:
-        input_data = task.input_data or {}
-        task_model = str(input_data.get("model_id") or input_data.get("modelId") or "")
-        if task.capability_code == "knowledge_edit":
-            if task_model == model_id and task.status == "succeeded":
-                break
+        if edit_created and task.created_at and task.created_at < edit_created:
             continue
         assessment = (task.result or {}).get("model_assessment") or {}
         if (

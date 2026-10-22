@@ -1,6 +1,7 @@
 from uuid import uuid4
+from hashlib import sha256
 from time import perf_counter, sleep
-from random import uniform
+from random import Random, uniform
 from pathlib import Path
 from app.adapters.mock_adapter import execute_mock_capability
 from app.core.database import SessionLocal
@@ -30,7 +31,8 @@ MAX_LOCAL_FILE_STORAGE_GB = 2.0
 
 def register_edited_version(db: Session, task_id: str, input_data: dict, config: dict) -> tuple[str, str]:
     """知识编辑成功后把“编辑后版本”登记进 model_versions，评估页下拉框才会真的多出可对比的版本。
-    命名沿用 {基线}-edit；只登记产物，不移动模型当前版本指针——编辑版本是评估用的支线。"""
+    每轮编辑是独立产物：第一轮命名 {基线}-edit，之后依次 {基线}-edit2、-edit3……
+    只登记产物，不移动模型当前版本指针——编辑版本是评估用的支线。"""
     try:
         model = db.get(Model, int(input_data.get("model_id") or input_data.get("modelId")))
     except (TypeError, ValueError):
@@ -38,7 +40,15 @@ def register_edited_version(db: Session, task_id: str, input_data: dict, config:
     if model is None:
         return "", ""
     baseline = str(config.get("model_version") or config.get("modelVersion") or "").strip() or model.version
-    edited = f"{baseline}-edit"
+    prefix = f"{baseline}-edit"
+    existing_rounds: list[int] = []
+    for item in db.scalars(select(ModelVersion).where(ModelVersion.model_id == model.id)).all():
+        if not item.version.startswith(prefix):
+            continue
+        suffix = item.version[len(prefix):]
+        existing_rounds.append(1 if suffix == "" else (int(suffix) if suffix.isdigit() else 0))
+    next_round = max(existing_rounds, default=0) + 1
+    edited = prefix if next_round == 1 else f"{prefix}{next_round}"
     exists = db.scalar(
         select(ModelVersion).where(
             ModelVersion.model_id == model.id,
@@ -486,18 +496,25 @@ def run_mock_task(
                     }
                 )
 
-                # 模型工作台评估页需要成组指标；按测试数据集生成稳定但不同的模拟结果。
+                # 模型工作台评估页需要成组指标；以评估任务 ID 为种子做确定性生成：
+                # 同一任务刷新数字稳定（结果已落库），不同任务各不相同，
+                # 与训练曲线的 sha256 种子同一套路。
                 if request.input.get("model_id") or request.input.get("modelId"):
                     model_id = str(request.input.get("model_id", request.input.get("modelId")))
                     dataset_id = str(request.input.get("dataset_id", request.input.get("datasetId", "1")))
-                    try:
-                        offset = int(dataset_id) % 5
-                    except ValueError:
-                        offset = 0
-                    risk_total = 108 + offset * 12
-                    target_total = 52 + offset * 4
-                    general_total = 46 + offset * 3
-                    retention_total = 70 + offset * 5
+                    rng = Random(int(sha256(task_id.encode("utf-8")).hexdigest(), 16))
+                    risk_total = rng.randint(96, 168)
+                    risk_before = round(risk_total * rng.uniform(0.22, 0.38))
+                    risk_after = max(1, round(risk_before * rng.uniform(0.08, 0.35)))
+                    target_total = rng.randint(48, 72)
+                    target_after = round(target_total * rng.uniform(0.88, 0.99))
+                    target_before = rng.randint(6, max(7, round(target_after * 0.35)))
+                    general_total = rng.randint(40, 60)
+                    general_after = round(general_total * rng.uniform(0.90, 0.99))
+                    general_before = max(1, general_after - rng.randint(2, 6))
+                    retention_total = rng.randint(64, 96)
+                    retention_before = retention_total
+                    retention_after = retention_total - rng.randint(0, 2)
                     result["model_assessment"] = {
                         "id": f"assessment-{task_id}", "task_id": task_id, "model_id": model_id,
                         "baseline": request.config.get("baseline_version", request.config.get("baselineVersion", "")),
@@ -505,10 +522,10 @@ def run_mock_task(
                         "dataset_id": dataset_id,
                         "dataset_version": request.config.get("dataset_version", request.config.get("datasetVersion", "")),
                         "knowledge": "模型版本安全效果评估", "status": "succeeded",
-                        "risk_total": risk_total, "risk_before": 34 + offset * 2, "risk_after": 5 + offset,
-                        "target_total": target_total, "target_before": 9 + offset, "target_after": target_total - 1,
-                        "general_total": general_total, "general_before": general_total - 4, "general_after": general_total - 1,
-                        "retention_total": retention_total, "retention_before": retention_total, "retention_after": retention_total - 1,
+                        "risk_total": risk_total, "risk_before": risk_before, "risk_after": risk_after,
+                        "target_total": target_total, "target_before": target_before, "target_after": target_after,
+                        "general_total": general_total, "general_before": general_before, "general_after": general_after,
+                        "retention_total": retention_total, "retention_before": retention_before, "retention_after": retention_after,
                         "samples": [{"type": "风险输出", "input": "模拟安全测试输入", "before": "存在风险线索", "after": "已完成安全约束"}],
                     }
 
