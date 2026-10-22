@@ -18,8 +18,6 @@ from app.repositories.resource_repository import (
 from app.repositories.task_repository import save, update
 from app.services.resource_display import (
     normalize_source_name,
-    task_dataset_default,
-    task_display_defaults,
     task_ingest_statistics,
     task_version_default,
 )
@@ -196,7 +194,7 @@ def run_mock_task(
             "数据源",
         )
     else:
-        default_source_name, _ = task_display_defaults(task_id)
+        # 非接入任务没有数据源这一语义，不得编造来源；空值由展示层兜底为“未填写来源”。
         source_name = normalize_source_name(
             input_data.get("source_name")
             or input_data.get("sourceName")
@@ -204,17 +202,16 @@ def run_mock_task(
             or input_data.get("sourceAddress")
             or input_data.get("connector_type")
             or input_data.get("connectorType")
-        ) or default_source_name
+        )
 
     dataset_name = (
         input_data.get("dataset_name")
         or input_data.get("datasetName")
         or dataset_name
-        or task_dataset_default(task_id)
     )
 
-    # 除非调用方明确传入数据量，否则每个新任务使用自身的随机展示容量；
-    # 不能直接复用目标数据集的总容量，否则连续新建任务会出现相同数值。
+    # 数据量只在接入任务里按来源计算；其他任务没有这一语义，只有调用方
+    # 显式传入才记录，不再生成随机展示容量（如模型调用页输出的 txt）。
     explicit_storage_gb = input_data.get("storage_gb") or input_data.get("storageGb")
     if is_ingest:
         uploaded_size_bytes = _uploaded_size_bytes(input_data.get("files"))
@@ -229,8 +226,7 @@ def run_mock_task(
         ) == "本地文件":
             raise ValueError("本地文件单次接入不能超过 2GB")
     else:
-        _, default_storage_gb = task_display_defaults(task_id)
-        storage_gb = float(explicit_storage_gb or default_storage_gb)
+        storage_gb = float(explicit_storage_gb or 0)
 
     # 关联模型
     model_id = request.input.get("model_id")
@@ -544,15 +540,20 @@ def run_mock_task(
                 if not isinstance(original_output, str) or not isinstance(governed_output, str):
                     raise ValueError("模型服务未返回完整治理结果")
 
+                # 本次调用实际跑在哪个服务版本上，调用记录与任务流水必须写同一个值；
+                # 否则 tasks.model_version（模型档案版本）会与 model_calls.version 对不上。
+                call_version = (
+                    request.config.get("model_version")
+                    or request.config.get("modelVersion")
+                    or service.version
+                )
+                model_version = call_version
+
                 db.add(ModelCall(
                     id=task_id,
                     model_id=str(requested_model_id),
                     service_id=service.id,
-                    version=(
-                        request.config.get("model_version")
-                        or request.config.get("modelVersion")
-                        or service.version
-                    ),
+                    version=call_version,
                     prompt=prompt.strip(),
                     original_output=original_output,
                     governed_output=governed_output,
@@ -572,6 +573,7 @@ def run_mock_task(
                     "status": status,
                     "dataset_name": dataset_name,
                     "storage_gb": storage_gb,
+                    "model_version": model_version,
                     "result": result,
                     "finished_at": now_utc(),
 

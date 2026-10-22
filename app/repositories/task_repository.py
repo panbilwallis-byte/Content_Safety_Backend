@@ -209,6 +209,7 @@ def update(
         "status",
         "dataset_name",
         "storage_gb",
+        "model_version",
         "result",
         "finished_at",
         "progress",
