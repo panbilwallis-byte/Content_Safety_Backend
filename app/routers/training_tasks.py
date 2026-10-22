@@ -4,12 +4,14 @@ from datetime import datetime
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from app.core.database import SessionLocal
 from app.core.response import success
 from app.core.time import now_shanghai
 from app.domain.schemas import CreateTrainingTaskRequest
-from app.models.tables import Dataset, Model, TrainingTask
+from app.models.tables import Dataset, Model, ModelVersion, TrainingTask
 
 
 router = APIRouter()
@@ -58,7 +60,46 @@ def _generate_training_logs(task_id: str, epochs: int, current_epoch: int) -> tu
     return loss, validation_loss, checkpoints
 
 
-def advance_training_task(task: TrainingTask, now: datetime) -> bool:
+def register_trained_version(db: Session, task: TrainingTask) -> None:
+    """训练成功后把目标版本登记为模型产物，保证模型管理页与训练台账互相对得上。"""
+    try:
+        model_id = int(task.model_id)
+    except (TypeError, ValueError):
+        return
+    model = db.get(Model, model_id)
+    if model is None or not task.target_version:
+        return
+    exists = db.scalar(
+        select(ModelVersion).where(
+            ModelVersion.model_id == model_id,
+            ModelVersion.version == task.target_version,
+        )
+    )
+    if exists is None:
+        db.add(ModelVersion(
+            model_id=model_id,
+            version=task.target_version,
+            description=f"由训练任务「{task.name}」（{task.id}）产出",
+            task_id=task.id,
+        ))
+    # 仅当基础版本仍是当前版本时才前移指针，避免用旧任务把新版本改回去。
+    if model.version == task.base_version:
+        model.version = task.target_version
+        model.updated_at = now_shanghai()
+
+
+def ensure_trained_model_versions() -> None:
+    """启动时补登历史成功训练任务的模型版本，修复登记逻辑上线前留下的缺口。"""
+    with SessionLocal() as db:
+        tasks = db.scalars(
+            select(TrainingTask).where(TrainingTask.status == "succeeded")
+        ).all()
+        for task in tasks:
+            register_trained_version(db, task)
+        db.commit()
+
+
+def advance_training_task(db: Session, task: TrainingTask, now: datetime) -> bool:
     """按真实经过时间缓慢推进演示训练；每次推进均写回数据库。"""
     if task.status != "running":
         return False
@@ -81,6 +122,7 @@ def advance_training_task(task: TrainingTask, now: datetime) -> bool:
     if target_epoch == task.epochs:
         task.status = "succeeded"
         task.progress = 100
+        register_trained_version(db, task)
     return True
 
 

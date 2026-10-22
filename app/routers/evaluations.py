@@ -8,7 +8,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from app.core.database import SessionLocal
 from app.core.response import success
 from app.core.time import now_shanghai
-from app.models.tables import Dataset, EvaluationMetric, EvaluationMetricRevision, EvaluationTask, EvaluationRun, EvaluationEvent, EvaluationWorkspaceItem
+from app.models.tables import Dataset, Model, EvaluationMetric, EvaluationMetricRevision, EvaluationTask, EvaluationRun, EvaluationEvent, EvaluationWorkspaceItem
 
 router = APIRouter()
 _preflights: dict[str, tuple[datetime, str]] = {}
@@ -117,6 +117,120 @@ def ensure_demo_runs(db):
         db.add_all([t, EvaluationRun(run_id=rid,task_id=tid,record_id=record,test_no="",name=name,task_status="succeeded",judgment_status=judgment,algorithm_mode="database",snapshot=snapshot,metric_results=metric_results,allowed_actions=["export"],integrity_state="complete" if judgment!="inconclusive" else "incomplete",config={},created_at=now,started_at=now,finished_at=now)])
     db.commit()
 
+def bridge_model_assessment(db, task_row, assessment: dict[str, Any]) -> None:
+    """把模型训推页「发起评估」的结果导入测试评估工作区归档。
+
+    record_id 取前端「查看测试记录」深链携带的 assessment id，运行 ID 由任务 ID
+    派生；重复导入同一任务只刷新快照，不新增行。与调用方共用事务，由外层统一提交。
+    """
+    record = str(assessment.get("id") or f"assessment-{task_row.task_id}")
+    task_id = f"eval_task_{task_row.task_id}"
+    run_id = f"eval_run_{task_row.task_id}"
+    now = task_row.finished_at or now_shanghai()
+    baseline = str(assessment.get("baseline") or "")
+    edited = str(assessment.get("edited") or "")
+    dataset_id = str(assessment.get("dataset_id") or "")
+    dataset = db.get(Dataset, int(dataset_id)) if dataset_id.isdigit() else None
+    dataset_name = dataset.name if dataset else ""
+    dataset_version = str(assessment.get("dataset_version") or (dataset.version if dataset else "") or f"数据集 #{dataset_id or '-'}")
+    model_id = str(assessment.get("model_id") or "")
+    model = db.get(Model, int(model_id)) if model_id.isdigit() else None
+    model_name = model.name if model else ""
+    model_version = " → ".join(v for v in (baseline, edited) if v) or "未记录"
+
+    # 编辑评估口径统一从验收指标库取已发布修订；库缺失时回退到旧阈值，保证桥接不中断。
+    library = {
+        row.metric_code: row
+        for row in db.scalars(
+            select(EvaluationMetricRevision).where(
+                EvaluationMetricRevision.metric_code.in_(
+                    ["edit_risk_reduction", "edit_target_success", "edit_generalization", "edit_retention"]
+                ),
+                EvaluationMetricRevision.configuration_status == "published",
+            )
+        ).all()
+    }
+
+    def metric(code: str, name: str, numerator: int, denominator: int, default_threshold: float) -> dict[str, Any]:
+        revision = library.get(code)
+        definition = (revision.definition or {}) if revision else {}
+        threshold = next((t for t in definition.get("thresholds", []) if t.get("stage") == "final"), None)
+        if threshold is None:
+            threshold = {"stage": "final", "comparator": "gte", "value": default_threshold, "unit": "ratio"}
+        limit = float(threshold.get("value", default_threshold))
+        value = round(numerator / denominator, 4) if denominator else 0.0
+        return {"metricCode": code, "name": name,
+                "revisionId": revision.revision_id if revision else f"rev-{code}-{task_row.task_id}", "value": value,
+                "unit": "ratio", "numerator": numerator, "denominator": denominator, "counts": [],
+                "thresholdSnapshot": threshold,
+                "judgmentStatus": "passed" if value >= limit else "failed",
+                "reasonCode": None if denominator else "zero_denominator",
+                "evidenceRefs": [f"evidence-{run_id}-{code}"], "gap": round(value - limit, 4),
+                "formula": definition.get("formula") or "分子 / 分母",
+                "formulaCode": definition.get("formulaCode") or code}
+
+    results = [
+        metric("edit_risk_reduction", "风险样本减少率",
+               max(assessment.get("risk_before", 0) - assessment.get("risk_after", 0), 0),
+               assessment.get("risk_before", 0), 0.6),
+        metric("edit_target_success", "目标编辑成功率", assessment.get("target_after", 0), assessment.get("target_total", 0), 0.9),
+        metric("edit_generalization", "泛化测试成功率", assessment.get("general_after", 0), assessment.get("general_total", 0), 0.9),
+        metric("edit_retention", "非目标能力保持率", assessment.get("retention_after", 0), assessment.get("retention_total", 0), 0.95),
+    ]
+    judgment = "failed" if any(item["judgmentStatus"] == "failed" for item in results) else "passed"
+    total_samples = sum(int(assessment.get(key, 0)) for key in ("risk_total", "target_total", "general_total", "retention_total"))
+    source_ref = {"entityType": "task_result", "entityId": str(task_row.task_id), "versionId": record,
+                  "name": f"{task_row.name}（模型训推评估）", "sourceModule": "model-training",
+                  "sourceTaskId": str(task_row.task_id), "sourceTraceId": task_row.trace_id or "",
+                  "contentHash": f"assessment:{task_row.task_id}", "capturedAt": iso(now),
+                  "datasetVersion": dataset_version, "modelVersion": model_version, "sampleCount": total_samples}
+    snapshot = {"resolvedRefs": [source_ref],
+                "metricRevisions": [rev_dict(library[code]) for code in
+                                    ("edit_risk_reduction", "edit_target_success", "edit_generalization", "edit_retention")
+                                    if code in library],
+                "datasetId": dataset_id, "datasetName": dataset_name, "datasetVersion": dataset_version,
+                "modelId": model_id, "modelName": model_name, "baselineVersion": baseline, "editedVersion": edited,
+                "modelVersion": model_version,
+                "labelVersion": "标签 v1.0", "sampleManifestHash": "模型评估桥接",
+                "sampleCount": total_samples, "sourceResultHashes": [source_ref["contentHash"]],
+                "evaluatorVersion": "model-assessment-bridge", "executionMode": "reference",
+                "createdAt": iso(task_row.created_at or now), "targetStage": "final"}
+    config = {"source": "model-train/evaluation", "capabilityTaskId": str(task_row.task_id)}
+    display_model = f"{model_name} {model_version}".strip()
+    display_dataset = f"{dataset_name} {dataset_version}".strip()
+
+    existing_run = db.get(EvaluationRun, run_id)
+    if existing_run:
+        existing_run.name = task_row.name
+        existing_run.snapshot = snapshot
+        existing_run.metric_results = results
+        existing_run.judgment_status = judgment
+        existing_run.task_status = "succeeded"
+        existing_run.finished_at = now
+        existing_task = db.get(EvaluationTask, task_id)
+        if existing_task:
+            existing_task.name = task_row.name
+            existing_task.dataset_version = display_dataset
+            existing_task.model_version = display_model
+            existing_task.judgment_status = judgment
+            existing_task.status = "succeeded"
+            existing_task.updated_at = now
+        db.flush()
+        return
+
+    archived = EvaluationTask(task_id=task_id, run_id=run_id, record_id=record, name=task_row.name,
+        status="succeeded", target_stage="final", dataset_version=display_dataset, model_version=display_model,
+        metric_count=len(results), judgment_status=judgment, allowed_actions=[], stage="archived",
+        trace_id=task_row.trace_id, processed_count=total_samples, total_count=total_samples, config=config,
+        created_at=task_row.created_at or now, started_at=now, finished_at=now, updated_at=now)
+    run = EvaluationRun(run_id=run_id, task_id=task_id, record_id=record,
+        test_no=f"EVAL-{now:%Y%m%d%H%M%S}", name=task_row.name, task_status="succeeded", judgment_status=judgment,
+        algorithm_mode="model_assessment", snapshot=snapshot, metric_results=results, allowed_actions=["export"],
+        integrity_state="complete", config=config, created_at=task_row.created_at or now, started_at=now, finished_at=now)
+    db.add_all([archived, run, EvaluationEvent(task_id=task_id, stage="archived",
+        message="模型评估结果已从模型训推页导入测试评估归档。", status="succeeded")])
+    db.flush()
+
 @router.get("/evaluation/session")
 def session(): return success({"role":"operator", "allowedActions":["read","write","start","cancel","retry"]})
 
@@ -215,8 +329,11 @@ def publish_revision(metric_id: str, revision_id: str, payload: dict[str, Any]):
 def tasks(keyword:str|None=None,status:str|None=None,stage:str|None=None,page:int=1,page_size:int=10):
     with SessionLocal() as db:
         ensure_demo_runs(db)
-        rows=db.scalars(select(EvaluationTask).order_by(EvaluationTask.created_at.desc())).all(); rows=[t for t in rows if (not keyword or keyword.lower() in t.name.lower()) and (not status or t.status==status) and (not stage or t.target_stage==stage)]
-        total=len(rows); return success({"items":[task_dict(t) for t in rows[(page-1)*page_size:page*page_size]],"total":total,"page":page,"pageSize":page_size,"totalPages":(total+page_size-1)//page_size,"summary":[{"name":s,"value":sum(t.status==s for t in rows)} for s in ["pending","running","failed"]]})
+        all_rows=db.scalars(select(EvaluationTask).order_by(EvaluationTask.created_at.desc())).all()
+        # 状态卡的计数只跟随搜索词与阶段变化，不受"状态"本身筛选影响，否则点任一状态卡都会把另外两张清零。
+        scoped=[t for t in all_rows if (not keyword or keyword.lower() in t.name.lower()) and (not stage or t.target_stage==stage)]
+        rows=[t for t in scoped if not status or t.status==status]
+        total=len(rows); return success({"items":[task_dict(t) for t in rows[(page-1)*page_size:page*page_size]],"total":total,"page":page,"pageSize":page_size,"totalPages":(total+page_size-1)//page_size,"summary":[{"name":s,"value":sum(t.status==s for t in scoped)} for s in ["pending","running","failed"]]})
 @router.get("/tasks/{task_id}")
 def task(task_id:str):
     with SessionLocal() as db:
@@ -405,7 +522,7 @@ def records(
 @router.get("/evaluation/record-resolutions")
 def resolve_record(record_id:str):
     with SessionLocal() as db:
-        r=db.scalar(select(EvaluationRun).where(EvaluationRun.record_id==record_id)); return success({"resolution":"available" if r else "not_found","runId":r.run_id if r else None,"candidates":[]})
+        r=db.scalar(select(EvaluationRun).where(EvaluationRun.record_id==record_id)); return success({"resolution":"resolved" if r else "not_found","runId":r.run_id if r else None,"candidates":[]})
 @router.get("/evaluation/runs/{run_id}/samples")
 def samples(run_id:str,metric_code:str,page:int=1,page_size:int=10,outcome:str|None=None): return success({"items":[],"total":0,"page":page,"pageSize":page_size,"totalPages":0,"summary":[]})
 @router.get("/evaluation/runs/{run_id}/evidence")

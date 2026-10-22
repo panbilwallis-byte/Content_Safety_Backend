@@ -43,6 +43,7 @@ from app.core.seed import (
     seed_initial_data,
 )
 from app.repositories.evaluation_repository import ensure_demo_evaluations
+from app.routers.training_tasks import ensure_trained_model_versions
 from app.services.compliance_service import seed_compliance_data
 
 from fastapi.responses import JSONResponse
@@ -93,6 +94,8 @@ async def lifespan(app: FastAPI):
     ensure_model_evaluation_versions()
     ensure_demo_evaluations()
     seed_compliance_data()
+    # 演示训练成功后必须能在模型管理页看到产物版本；补登历史成功任务。
+    ensure_trained_model_versions()
 
     print("MySQL 数据表初始化完成")
     yield

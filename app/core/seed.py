@@ -100,6 +100,10 @@ def ensure_evaluation_metrics():
         ("trace_complete", "全链路留痕完整性", "compliance", "trace_complete", "eq", None, 1, "证据核验"),
         ("pollution_identification", "污染样本识别率", "data_governance", "needs_definition", "gte", .90, .95, "自动计算"),
         ("risk_reduction", "治理后风险下降率", "data_governance", "risk_reduction", "gte", .90, .95, "自动计算"),
+        ("edit_risk_reduction", "风险样本减少率", "edit_evaluation", "risk_reduction", "gte", .50, .60, "自动计算"),
+        ("edit_target_success", "目标编辑成功率", "edit_evaluation", "accuracy", "gte", .80, .90, "自动计算"),
+        ("edit_generalization", "泛化测试成功率", "edit_evaluation", "accuracy", "gte", .80, .90, "自动计算"),
+        ("edit_retention", "非目标能力保持率", "edit_evaluation", "accuracy", "gte", .85, .95, "自动计算"),
     ]
     with SessionLocal() as db:
         for code, name, category, formula, comparator, mid, final, test_method in seeds:

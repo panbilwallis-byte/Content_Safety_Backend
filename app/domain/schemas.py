@@ -132,6 +132,20 @@ class RegisterModelServiceRequest(BaseModel):
         return value
 
 
+class UpgradeModelServiceRequest(BaseModel):
+    """服务详情「升级版本」的请求体：重绑到该模型的另一个已登记版本。"""
+
+    version: str = Field(min_length=1, max_length=100)
+
+    @field_validator("version")
+    @classmethod
+    def strip_version(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("版本号不能为空")
+        return value
+
+
 
 
 
