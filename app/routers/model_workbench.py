@@ -1,7 +1,7 @@
 from time import perf_counter
 from uuid import uuid4
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from hashlib import sha256
 from sqlalchemy import select
 
@@ -195,6 +195,44 @@ def current_model_workbench():
         },
         message="模型工作台数据查询成功",
     )
+
+
+@router.get("/model-workbenches/assessment")
+def model_workbench_assessment(
+    model_id: str = Query(..., max_length=64),
+    baseline: str = Query(..., max_length=100),
+    edited: str = Query(..., max_length=100),
+    dataset_id: str = Query(..., max_length=64),
+    dataset_version: str = Query(..., max_length=100),
+):
+    """返回指定“模型+基线+编辑后+测试集”组合的最新评估结果。
+
+    聚合接口只携带全局最新一条评估，切换测试集再切回来时旧结果看似被覆盖；
+    本接口按五要素回查历史任务。若该模型在评估之后又发生了成功的编辑任务，
+    旧评估视为过期，与聚合接口的 assessmentStale 口径一致。"""
+    with SessionLocal() as db:
+        rows = db.scalars(
+            select(Task)
+            .where(Task.capability_code.in_(("evaluation", "knowledge_edit")))
+            .order_by(Task.created_at.desc(), Task.task_id.desc())
+        ).all()
+    for task in rows:
+        input_data = task.input_data or {}
+        task_model = str(input_data.get("model_id") or input_data.get("modelId") or "")
+        if task.capability_code == "knowledge_edit":
+            if task_model == model_id and task.status == "succeeded":
+                break
+            continue
+        assessment = (task.result or {}).get("model_assessment") or {}
+        if (
+            str(assessment.get("model_id") or "") == model_id
+            and str(assessment.get("baseline") or "") == baseline
+            and str(assessment.get("edited") or "") == edited
+            and str(assessment.get("dataset_id") or "") == dataset_id
+            and str(assessment.get("dataset_version") or "") == dataset_version
+        ):
+            return success(data=assessment, message="评估结果查询成功")
+    return success(data=None, message="该组合尚无评估结果")
 
 
 @router.post("/model-services")
