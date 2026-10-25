@@ -1,7 +1,11 @@
+import os
 from hashlib import sha256
 from random import Random
 from datetime import datetime
 from uuid import uuid4
+
+import httpx
+from fastapi import Header
 
 from fastapi import APIRouter, HTTPException
 from sqlalchemy import select
@@ -10,7 +14,7 @@ from sqlalchemy.orm import Session
 from app.core.database import SessionLocal
 from app.core.response import success
 from app.core.time import now_shanghai
-from app.domain.schemas import CreateTrainingTaskRequest
+from app.domain.schemas import CreateTrainingTaskRequest, CreateRealTrainingRequest, SyncTrainingTaskRequest
 from app.models.tables import Dataset, Model, ModelVersion, TrainingTask
 from app.services.compliance_event_service import add_event
 
@@ -195,3 +199,119 @@ def create_training_task(request: CreateTrainingTaskRequest):
         db.commit()
         db.refresh(task)
         return success(data=training_task_payload(task), message="训练任务已创建并开始训练")
+
+
+LLM_TRAINING_BASE_URL = os.getenv("LLM_TRAINING_BASE_URL", "http://127.0.0.1:8001/api/v1/training")
+LLM_SETUP_SECRET = os.getenv("LLM_SETUP_SECRET", "")
+
+
+@router.post("/training-tasks/real")
+def create_real_training_task(request: CreateRealTrainingRequest,
+                              authorization: str = Header(default="")):
+    """浏览器令牌透传给 8001 建迷你脚本任务，成功后登记同款台账。
+
+    模型服务按令牌隔离任务，因此建单必须使用浏览器自己的访问令牌；
+    X-Setup-Secret 只保存在本服务环境变量中，不进前端产物。
+    """
+    if not LLM_SETUP_SECRET:
+        raise HTTPException(status_code=501, detail="未配置 LLM_SETUP_SECRET，无法代理真实训练建单")
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=422, detail="缺少模型服务访问令牌，请先在页签右侧配置令牌")
+    with SessionLocal() as db:
+        try:
+            model_id = int(request.model_id)
+            dataset_id = int(request.dataset_id)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422, detail="模型和数据集 ID 必须为数字") from None
+        model = db.get(Model, model_id)
+        if model is None:
+            raise HTTPException(status_code=404, detail="基础模型不存在")
+        dataset = db.get(Dataset, dataset_id)
+        if dataset is None:
+            raise HTTPException(status_code=404, detail="训练数据集不存在")
+        upstream = httpx.post(
+            f"{LLM_TRAINING_BASE_URL}/script-tasks",
+            json={"name": request.name.strip(), "script_id": "mini-mlp",
+                  "parameters": {"epochs": request.epochs, "learning_rate": request.learning_rate}},
+            headers={"Authorization": authorization, "X-Setup-Secret": LLM_SETUP_SECRET},
+            timeout=30,
+        )
+        if upstream.status_code >= 400:
+            try:
+                message = upstream.json().get("message") or upstream.text[:200]
+            except ValueError:
+                message = upstream.text[:200]
+            raise HTTPException(status_code=upstream.status_code, detail=f"模型服务建单失败：{message}")
+        llm_task = upstream.json()["data"]
+        now = now_shanghai()
+        task = TrainingTask(
+            id=llm_task["id"], name=request.name.strip(), status="pending", progress=0,
+            model_id=str(model_id), base_version=request.base_version.strip(),
+            dataset_id=str(dataset_id), dataset_version=request.dataset_version.strip(),
+            epochs=request.epochs, epoch=0, learning_rate=request.learning_rate,
+            batch_size=request.batch_size, target_version=request.target_version.strip(),
+            method=request.method.strip(), loss_history=[], validation_loss_history=[],
+            checkpoints=[], created_at=now, updated_at=now,
+        )
+        db.add(task)
+        add_event(db, subject_type="training_task", subject_id=task.id, training_task_id=task.id,
+                  event_type="训练任务启动",
+                  detail=f"{task.name}：真实脚本 mini-mlp，模型 {model.name} {task.base_version}，"
+                         f"数据集 {dataset.name} {task.dataset_version}，{task.epochs} 轮 · {task.method}")
+        if (dataset.metadata_json or {}).get("usage") == "test":
+            add_event(db, subject_type="training_task", subject_id=task.id, training_task_id=task.id,
+                      event_type="训练数据越权访问尝试", level="high",
+                      detail=f"数据集「{dataset.name}」标记为测试专用（usage=test），请核实任务 {task.id}")
+        db.commit()
+        db.refresh(task)
+        payload = training_task_payload(task)
+        payload["llm_task_id"] = llm_task["id"]
+        return success(data=payload, message="真实训练任务已创建，等待模型服务执行")
+
+
+@router.post("/training-tasks/{task_id}/sync")
+def sync_real_training_task(task_id: str, request: SyncTrainingTaskRequest):
+    """把模型服务的真实进度同步进台账；轮次、检查点与终态生成合规事件。"""
+    with SessionLocal() as db:
+        task = db.get(TrainingTask, task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="训练任务不存在")
+        if len(task_id) < 20:
+            # 旧演示任务由服务端时间推进，不接受外部同步，避免双写打架。
+            return success(data=training_task_payload(task), message="演示任务由服务端推进，忽略同步")
+        previous_epoch = task.epoch
+        previous_status = task.status
+        task.status = request.status
+        task.epoch = min(request.epoch, task.epochs)
+        task.progress = round(request.progress)
+        task.loss_history = request.loss_history
+        task.validation_loss_history = request.validation_loss_history
+        task.checkpoints = request.checkpoints
+        task.updated_at = now_shanghai()
+        for epoch_index in range(previous_epoch + 1, task.epoch + 1):
+            train_loss = request.loss_history[epoch_index - 1] if len(request.loss_history) >= epoch_index else "—"
+            valid_loss = (request.validation_loss_history[epoch_index - 1]
+                          if len(request.validation_loss_history) >= epoch_index else "—")
+            add_event(db, subject_type="training_task", subject_id=task.id, training_task_id=task.id,
+                      event_type="训练轮次完成",
+                      detail=f"第 {epoch_index} 轮（真实训练）：训练损失 {train_loss}，验证损失 {valid_loss}")
+        for checkpoint in request.checkpoints:
+            if isinstance(checkpoint, dict) and checkpoint.get("epoch", 0) > previous_epoch:
+                add_event(db, subject_type="training_task", subject_id=task.id, training_task_id=task.id,
+                          event_type="检查点保存",
+                          detail=f"{checkpoint.get('name', 'checkpoint')}（第 {checkpoint.get('epoch')} 轮，"
+                                 f"验证损失 {checkpoint.get('loss')}）")
+        if request.status in {"succeeded", "failed", "canceled"} and previous_status not in {
+                "succeeded", "failed", "canceled"}:
+            if request.status == "succeeded":
+                register_trained_version(db, task)
+                add_event(db, subject_type="training_task", subject_id=task.id, training_task_id=task.id,
+                          event_type="训练任务完成",
+                          detail=f"真实训练完成 {task.epoch}/{task.epochs} 轮，目标版本 {task.target_version} 已登记")
+            else:
+                add_event(db, subject_type="training_task", subject_id=task.id, training_task_id=task.id,
+                          event_type="训练任务失败", level="high",
+                          detail=request.error_message or f"任务以 {request.status} 结束")
+        db.commit()
+        db.refresh(task)
+        return success(data=training_task_payload(task), message="训练进度已同步")

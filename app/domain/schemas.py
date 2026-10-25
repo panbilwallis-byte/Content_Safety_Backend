@@ -160,3 +160,30 @@ class RecordModelCallRequest(BaseModel):
     reconstruction: str | None = None
     elapsed_ms: int = Field(ge=0)
     trace_id: str | None = Field(default=None, max_length=100)
+
+
+class CreateRealTrainingRequest(BaseModel):
+    """真实训练账本登记请求：由业务后端代理 8001 建单后记录同款台账。"""
+
+    name: str = Field(min_length=1, max_length=255)
+    model_id: str | int
+    base_version: str = Field(min_length=1, max_length=100)
+    dataset_id: str | int
+    dataset_version: str = Field(min_length=1, max_length=100)
+    epochs: int = Field(ge=1, le=100)
+    learning_rate: float = Field(gt=0, le=1)
+    batch_size: int = Field(ge=1, le=256)
+    target_version: str = Field(min_length=1, max_length=100)
+    method: str = Field(default="低秩适配微调", min_length=1, max_length=64)
+
+
+class SyncTrainingTaskRequest(BaseModel):
+    """真实训练任务的进度同步请求：曲线、检查点与终态由模型服务的真实指标聚合而来。"""
+
+    status: str = Field(pattern="^(running|succeeded|failed|canceled)$")
+    epoch: int = Field(ge=0)
+    progress: float = Field(ge=0, le=100)
+    loss_history: list[float] = Field(default_factory=list)
+    validation_loss_history: list[float] = Field(default_factory=list)
+    checkpoints: list[dict] = Field(default_factory=list)
+    error_message: str | None = Field(default=None, max_length=2000)
