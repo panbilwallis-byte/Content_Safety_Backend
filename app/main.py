@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from app.core.response import success
 from app.core.database import (
     Base,
+    SessionLocal,
     close_database_connection,
     engine,
     test_database_connection,
@@ -44,6 +45,7 @@ from app.core.seed import (
 )
 from app.repositories.evaluation_repository import ensure_demo_evaluations
 from app.routers.training_tasks import ensure_trained_model_versions
+from app.routers.model_workbench import sync_model_call_tasks
 from app.services.compliance_service import seed_compliance_data
 
 from fastapi.responses import JSONResponse
@@ -95,6 +97,10 @@ async def lifespan(app: FastAPI):
     seed_compliance_data()
     # 演示训练成功后必须能在模型管理页看到产物版本；补登历史成功任务。
     ensure_trained_model_versions()
+    # 真实调用只写 model_calls，而全链路追踪以 tasks 为索引；启动时补挂历史调用流水。
+    with SessionLocal() as db:
+        if sync_model_call_tasks(db):
+            db.commit()
 
     print("MySQL 数据表初始化完成")
     yield

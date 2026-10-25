@@ -301,6 +301,48 @@ def register_model_service(request: RegisterModelServiceRequest):
         return success(data=_service_payload(service), message="推理服务已登记，等待连接检查")
 
 
+def sync_model_call_tasks(db) -> int:
+    """为尚无任务流水的调用记录补挂 tasks 行。
+
+    全链路追踪页的下拉、深链匹配和五要素证据（evidence-task-{id}）都以 tasks 表为索引；
+    真实调用只写 model_calls 会整块失联，这里按同一 CALL 编号补挂，可重复执行。
+    """
+    missing = db.scalars(
+        select(ModelCall).where(ModelCall.id.not_in(select(Task.task_id))).order_by(ModelCall.created_at)
+    ).all()
+    for call in missing:
+        service = db.get(ModelService, call.service_id)
+        title = call.prompt[:20] + ("…" if len(call.prompt) > 20 else "")
+        db.add(Task(
+            task_id=call.id,
+            name=f"模型调用：{title}",
+            capability_code="model_risk_governance",
+            trace_id=call.trace_id,
+            status=call.status,
+            source_name=service.name if service else call.service_id,
+            storage_gb=0,
+            progress=100,
+            success_count=1,
+            input_data={
+                "model_call_id": call.id,
+                "endpoint": service.endpoint if service else None,
+                "prompt": call.prompt,
+                "elapsed_ms": call.elapsed_ms,
+            },
+            config={},
+            result={
+                "summary": call.governed_output,
+                "risk_level": call.risk_level,
+                "reason": call.reason,
+                "original_output": call.original_output,
+            },
+            model_version=call.version,
+            created_at=call.created_at,
+            finished_at=call.created_at,
+        ))
+    return len(missing)
+
+
 @router.post("/model-calls")
 def record_model_call(request: RecordModelCallRequest):
     """模型调用页真实调用成功后回写留痕；风险命中同时记录合规事件（GN-018）。"""
@@ -332,6 +374,7 @@ def record_model_call(request: RecordModelCallRequest):
                       event_type="模型输出异常告警", level=call.risk_level,
                       detail=call.reason or "输出风险判定命中，但未返回判定依据",
                       trace_id=call.trace_id)
+        sync_model_call_tasks(db)
         db.commit()
         return success(data={"id": call.id}, message="调用留痕已登记")
 
