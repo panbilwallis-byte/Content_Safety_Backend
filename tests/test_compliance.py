@@ -90,7 +90,7 @@ class ComplianceApiTest(unittest.TestCase):
         self.db.close()
 
     def test_contexts_return_one_candidate_per_version(self):
-        response = contexts("dataset", None, None, self.db)
+        response = contexts("dataset", None, None, db=self.db)
         candidates = response["data"]["candidates"]
         versions = {item["model_version"] for item in candidates}
         self.assertIn("dsv_000001", versions)
