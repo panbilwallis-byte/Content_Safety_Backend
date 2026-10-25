@@ -146,6 +146,17 @@ class UpgradeModelServiceRequest(BaseModel):
         return value
 
 
+class RecordModelCallRequest(BaseModel):
+    """模型调用页真实调用模型服务成功后的留痕回写请求体。"""
 
-
-
+    model_id: str | int
+    service_id: str = Field(min_length=1, max_length=64)
+    version: str = Field(default="", max_length=100)
+    prompt: str = Field(min_length=1, max_length=4000)
+    original_output: str
+    governed_output: str
+    reason: str = Field(default="", max_length=2000)
+    risk_level: str = Field(pattern="^(high|medium|low|unknown)$")
+    reconstruction: str | None = None
+    elapsed_ms: int = Field(ge=0)
+    trace_id: str | None = Field(default=None, max_length=100)

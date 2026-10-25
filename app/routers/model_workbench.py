@@ -8,7 +8,8 @@ from sqlalchemy import select
 from app.core.database import SessionLocal
 from app.core.response import success
 from app.core.time import now_shanghai
-from app.domain.schemas import RegisterModelServiceRequest, UpgradeModelServiceRequest
+from app.domain.schemas import RegisterModelServiceRequest, UpgradeModelServiceRequest, RecordModelCallRequest
+from app.services.compliance_event_service import add_event
 from app.models.tables import Dataset, Model, ModelVersion, ModelService, ModelCall, TrainingTask, Task
 from app.routers.training_tasks import advance_training_task, training_task_payload
 
@@ -298,6 +299,41 @@ def register_model_service(request: RegisterModelServiceRequest):
         db.commit()
         db.refresh(service)
         return success(data=_service_payload(service), message="推理服务已登记，等待连接检查")
+
+
+@router.post("/model-calls")
+def record_model_call(request: RecordModelCallRequest):
+    """模型调用页真实调用成功后回写留痕；风险命中同时记录合规事件（GN-018）。"""
+    with SessionLocal() as db:
+        service = db.get(ModelService, request.service_id)
+        if service is None:
+            raise HTTPException(status_code=404, detail="调用服务不存在")
+        if service.status != "running":
+            raise HTTPException(status_code=422, detail="服务未处于运行状态，不能登记调用留痕")
+        call = ModelCall(
+            id=f"CALL-{uuid4().hex[:8]}",
+            model_id=str(request.model_id),
+            service_id=service.id,
+            version=request.version or service.version,
+            prompt=request.prompt.strip(),
+            original_output=request.original_output,
+            governed_output=request.governed_output,
+            reason=request.reason,
+            risk_level=request.risk_level,
+            reconstruction=request.reconstruction,
+            elapsed_ms=request.elapsed_ms,
+            status="succeeded",
+            trace_id=request.trace_id,
+            created_at=now_shanghai(),
+        )
+        db.add(call)
+        if call.risk_level in {"high", "medium"}:
+            add_event(db, subject_type="model_call", subject_id=call.id,
+                      event_type="模型输出异常告警", level=call.risk_level,
+                      detail=call.reason or "输出风险判定命中，但未返回判定依据",
+                      trace_id=call.trace_id)
+        db.commit()
+        return success(data={"id": call.id}, message="调用留痕已登记")
 
 
 @router.patch("/model-services/{service_id}")
