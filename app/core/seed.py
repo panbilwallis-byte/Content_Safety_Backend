@@ -339,6 +339,38 @@ from sqlalchemy import inspect, text
 # from app.db import engine
 
 
+DEMO_PASSWORDS = {
+    "admin": "admin123",
+    "governance_manager": "gm123456",
+    "auditor": "auditor123",
+    "analyst": "analyst123",
+}
+
+
+def ensure_user_passwords():
+    """为 system_users 补 password_hash 列，并给四个演示账号设置初始口令。
+
+    仅对口令为空的账号写入，重复启动不会覆盖用户后续自行修改的口令。
+    演示口令写在代码里是原型阶段的有意取舍，正式部署必须全部改掉。
+    """
+    from app.core.auth import hash_password
+
+    inspector = inspect(engine)
+    if not inspector.has_table("system_users"):
+        return
+    columns = {column["name"] for column in inspector.get_columns("system_users")}
+    if "password_hash" not in columns:
+        with engine.begin() as connection:
+            connection.execute(text(
+                "ALTER TABLE system_users ADD COLUMN password_hash VARCHAR(200) NOT NULL DEFAULT ''"))
+    with SessionLocal() as db:
+        for username, password in DEMO_PASSWORDS.items():
+            user = db.scalar(select(SystemUser).where(SystemUser.username == username))
+            if user is not None and not user.password_hash:
+                user.password_hash = hash_password(password)
+        db.commit()
+
+
 def ensure_dataset_source_type_column():
     """为已有数据库补充数据集来源类型列；新表由 ORM 自动创建。"""
     inspector = inspect(engine)

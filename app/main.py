@@ -12,6 +12,7 @@ from app.core.database import (
 
 from app.models import tables
 from app.routers import (
+    auth,
     tasks,
     audit,
     resources,
@@ -27,7 +28,9 @@ from app.routers import (
     compliance_events,
 )
 
+from app.core.auth import parse_token
 from app.core.seed import (
+    ensure_user_passwords,
     ensure_dataset_source_type_column,
     ensure_resource_display_values,
     ensure_ingest_demo_tasks,
@@ -64,6 +67,7 @@ from fastapi import Request
 from app.core.response import (
     set_trace_id,
     reset_trace_id,
+    fail,
 )
 
 
@@ -76,6 +80,7 @@ async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
 
     ensure_dataset_source_type_column()
+    ensure_user_passwords()
     ensure_task_columns()
     ensure_dataset_record_columns()
     ensure_model_columns()
@@ -122,6 +127,36 @@ app = FastAPI(
 )
 
 
+AUTH_WHITELIST = {"/api/v1/auth/login"}
+WRITE_METHODS = {"POST", "PATCH", "PUT", "DELETE"}
+
+
+@app.middleware("http")
+async def enforce_platform_auth(request: Request, call_next):
+    """平台登录鉴权（#9）：/api/v1 一律要求有效令牌；只读账号拦截全部写方法。
+
+    CORS 在本中间件之后注册、处于更外层，预检与错误响应都会带上跨域头。
+    """
+    path = request.url.path
+    if request.method == "OPTIONS" or not path.startswith("/api/v1") or path in AUTH_WHITELIST:
+        return await call_next(request)
+    header = request.headers.get("authorization", "")
+    token = header[7:].strip() if header.startswith("Bearer ") else ""
+    user = parse_token(token) if token else None
+    if user is None:
+        return JSONResponse(status_code=401, content=fail("未登录或登录已过期", code=401))
+    request.state.user = user
+    if request.method in WRITE_METHODS and user.get("tier") == "reader":
+        return JSONResponse(status_code=403,
+                            content=fail("当前账号为只读权限，不能执行该操作", code=403))
+    return await call_next(request)
+
+
+app.include_router(
+    auth.router,
+    prefix="/api/v1",
+    tags=["登录鉴权"],
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[

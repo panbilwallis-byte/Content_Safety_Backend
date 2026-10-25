@@ -556,6 +556,13 @@ class SystemUser(Base):
         default="active",
     )
 
+    # PBKDF2 口令散列（pbkdf2_sha256$迭代$盐$摘要）；空值表示尚未设置口令，无法登录。
+    password_hash: Mapped[str] = mapped_column(
+        String(200),
+        nullable=False,
+        default="",
+    )
+
     description: Mapped[str] = mapped_column(
         Text,
         nullable=False,

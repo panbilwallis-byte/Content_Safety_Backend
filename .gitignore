@@ -13,3 +13,6 @@ __pycache__/
 .cache/
 logs/
 *.log
+
+# 运行期上传与鉴权密钥，不进 git
+storage/
