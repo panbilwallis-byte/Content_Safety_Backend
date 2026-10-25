@@ -733,3 +733,27 @@ class EvaluationEvent(Base):
     message: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(String(30), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_shanghai, nullable=False)
+
+
+class ComplianceEvent(Base):
+    """合规事件（GN-018）：训练与推理环节真实状态变化的追加式留痕。
+
+    只追加不修改：处置、复核等后续动作作为新事件写入，保留原始记录。
+    """
+
+    __tablename__ = "compliance_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # 关联的训练任务；推理侧事件也携带上下文任务 ID（如有）。
+    training_task_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    # training_task / model_call
+    subject_type: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    subject_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    # low / medium / high
+    level: Mapped[str] = mapped_column(String(16), default="low", nullable=False)
+    # recorded / blocked / handled / ignored
+    status: Mapped[str] = mapped_column(String(16), default="recorded", nullable=False)
+    detail: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    trace_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_shanghai, nullable=False)

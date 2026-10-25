@@ -12,6 +12,7 @@ from app.core.response import success
 from app.core.time import now_shanghai
 from app.domain.schemas import CreateTrainingTaskRequest
 from app.models.tables import Dataset, Model, ModelVersion, TrainingTask
+from app.services.compliance_event_service import add_event
 
 
 router = APIRouter()
@@ -112,6 +113,7 @@ def advance_training_task(db: Session, task: TrainingTask, now: datetime) -> boo
     )
     if target_epoch <= task.epoch:
         return False
+    previous_epoch = task.epoch
     loss, validation_loss, checkpoints = _generate_training_logs(task.id, task.epochs, target_epoch)
     task.epoch = target_epoch
     task.progress = round(target_epoch * 100 / task.epochs)
@@ -119,10 +121,24 @@ def advance_training_task(db: Session, task: TrainingTask, now: datetime) -> boo
     task.validation_loss_history = validation_loss
     task.checkpoints = checkpoints
     task.updated_at = now
+    for epoch_index in range(previous_epoch + 1, target_epoch + 1):
+        add_event(db, subject_type="training_task", subject_id=task.id, training_task_id=task.id,
+                  event_type="训练轮次完成",
+                  detail=f"第 {epoch_index} 轮：训练损失 {loss[epoch_index - 1]}，"
+                         f"验证损失 {validation_loss[epoch_index - 1]}")
+    for checkpoint in checkpoints:
+        if checkpoint["epoch"] > previous_epoch:
+            add_event(db, subject_type="training_task", subject_id=task.id, training_task_id=task.id,
+                      event_type="检查点保存",
+                      detail=f"{checkpoint['name']}（第 {checkpoint['epoch']} 轮，"
+                             f"验证损失 {checkpoint['loss']}）")
     if target_epoch == task.epochs:
         task.status = "succeeded"
         task.progress = 100
         register_trained_version(db, task)
+        add_event(db, subject_type="training_task", subject_id=task.id, training_task_id=task.id,
+                  event_type="训练任务完成",
+                  detail=f"共 {task.epochs} 轮完成，目标版本 {task.target_version} 已登记")
     return True
 
 
@@ -136,9 +152,11 @@ def create_training_task(request: CreateTrainingTaskRequest):
             dataset_id = int(request.dataset_id)
         except (TypeError, ValueError):
             raise HTTPException(status_code=422, detail="模型和数据集 ID 必须为数字") from None
-        if db.get(Model, model_id) is None:
+        model = db.get(Model, model_id)
+        if model is None:
             raise HTTPException(status_code=404, detail="基础模型不存在")
-        if db.get(Dataset, dataset_id) is None:
+        dataset = db.get(Dataset, dataset_id)
+        if dataset is None:
             raise HTTPException(status_code=404, detail="训练数据集不存在")
 
         task_id = f"TR-{uuid4().hex[:8]}"
@@ -164,6 +182,16 @@ def create_training_task(request: CreateTrainingTaskRequest):
             updated_at=now,
         )
         db.add(task)
+        add_event(db, subject_type="training_task", subject_id=task_id, training_task_id=task_id,
+                  event_type="训练任务启动",
+                  detail=f"{task.name}：模型 {model.name} {task.base_version}，"
+                         f"数据集 {dataset.name} {task.dataset_version}，"
+                         f"{task.epochs} 轮 · {task.method}")
+        if (dataset.metadata_json or {}).get("usage") == "test":
+            add_event(db, subject_type="training_task", subject_id=task_id, training_task_id=task_id,
+                      event_type="训练数据越权访问尝试", level="high",
+                      detail=f"数据集「{dataset.name}」标记为测试专用（usage=test），"
+                             f"不应作为训练输入，请核实任务 {task_id}")
         db.commit()
         db.refresh(task)
         return success(data=training_task_payload(task), message="训练任务已创建并开始训练")

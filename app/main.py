@@ -23,6 +23,7 @@ from app.routers import (
     files,
     training_tasks,
     compliance,
+    compliance_events,
 )
 
 from app.core.seed import (
@@ -248,6 +249,11 @@ app.include_router(
     capabilities.router,
     prefix="/api/v1",
     tags=["能力目录"],
+)
+app.include_router(
+    compliance_events.router,
+    prefix="/api/v1",
+    tags=["训练中合规事件"],
 )
 
 

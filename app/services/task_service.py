@@ -12,6 +12,7 @@ from app.core.time import now_shanghai
 from app.domain.capabilities import is_supported
 from app.domain.schemas import ExecuteTaskRequest
 from app.repositories.audit_repository import add_log
+from app.services.compliance_event_service import add_event
 from app.repositories.evaluation_repository import save_evaluation
 from app.repositories.resource_repository import (
     find_metric,
@@ -610,6 +611,12 @@ def run_mock_task(
                     trace_id=trace_id,
                     created_at=now_shanghai(),
                 ))
+                risk_level_value = str(risk_check.get("level") or "unknown")
+                if risk_level_value in {"high", "medium"}:
+                    add_event(db, subject_type="model_call", subject_id=task_id,
+                              event_type="模型输出异常告警", level=risk_level_value,
+                              detail=str(risk_check.get("reason") or "输出风险判定命中，但未返回判定依据"),
+                              trace_id=trace_id)
 
             # 风险知识编辑成功后登记真实的编辑后版本，并把结果里的版本字段改为实际值，
             # 替换模拟适配器写死的 v1.0.0/v1.0.1，保证任务流水与 model_versions 对得上。
