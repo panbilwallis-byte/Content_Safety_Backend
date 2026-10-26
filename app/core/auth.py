@@ -1,6 +1,6 @@
 """平台登录鉴权核心（#9）：PBKDF2 口令散列、HMAC 签名令牌、只读/操作两级权限。
 
-令牌为无状态签名串（payload.signature），12 小时有效；密钥取环境变量
+令牌为无状态签名串（payload.signature），一年有效；密钥取环境变量
 AUTH_SECRET，缺省时持久化在 storage/auth_secret.key（不进 git）。
 口令散列用标准库 pbkdf2_sha256，不引入额外依赖。
 """
@@ -16,7 +16,8 @@ import time
 from pathlib import Path
 
 ITERATIONS = 260_000
-TOKEN_TTL_SECONDS = 12 * 3600
+# 演示期长登录：一年有效。无状态令牌无法单独吊销，公开部署前应调短并轮换密钥。
+TOKEN_TTL_SECONDS = 365 * 24 * 3600
 # 只读角色：能看不能写，写方法在中间件层统一拦截。
 READER_ROLES = {"审计员", "auditor", "只读"}
 
