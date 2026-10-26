@@ -1,6 +1,7 @@
 from time import perf_counter
 from uuid import uuid4
 
+import httpx
 from fastapi import APIRouter, HTTPException, Query
 from hashlib import sha256
 from sqlalchemy import select
@@ -464,20 +465,47 @@ def delete_model_service(service_id: str):
         return success(data={"id": service_id, "name": name}, message=f"服务「{name}」已删除")
 
 
+PROBE_TIMEOUT_SECONDS = 3.0
+
+
+def probe_endpoint(endpoint: str) -> tuple[bool, int | None, str | None]:
+    """真实探活：GET 服务地址，返回 (是否可用, 往返毫秒, 失败原因)。"""
+    started = perf_counter()
+    try:
+        with httpx.Client(timeout=PROBE_TIMEOUT_SECONDS) as client:
+            response = client.get(endpoint)
+    except httpx.TimeoutException:
+        return False, None, f"{PROBE_TIMEOUT_SECONDS:.0f} 秒内未响应"
+    except httpx.HTTPError as exc:
+        return False, None, f"连接失败：{exc.__class__.__name__}"
+    latency = max(1, round((perf_counter() - started) * 1000))
+    if response.status_code >= 400:
+        return False, latency, f"服务返回 HTTP {response.status_code}"
+    return True, latency, None
+
+
 @router.post("/model-services/{service_id}/check")
 def check_model_service(service_id: str):
-    """记录连接检查结果，供后续模型调用前判断服务状态。"""
+    """向登记的服务地址发一次真实请求；探不通不得记为"已核验"，也不得留在运行中状态。"""
     with SessionLocal() as db:
         service = db.get(ModelService, service_id)
         if service is None:
             raise HTTPException(status_code=404, detail="推理服务不存在")
-
-        started = perf_counter()
-        # 当前平台尚未托管模型进程，先记录配置检查结果；真实探活由编排器接入。
+        endpoint = (service.endpoint or "").strip()
+        if not endpoint.startswith(("http://", "https://")):
+            # 演示占位地址（local://…）无从探活：如实拒绝，不写任何核验结果，页面保持"未检查"。
+            raise HTTPException(
+                status_code=422,
+                detail=f"「{endpoint}」不是可探活的 HTTP 地址，未记录核验结果；请改为真实推理服务地址")
+        reachable, latency, reason = probe_endpoint(endpoint)
         service.checked_at = now_shanghai()
-        service.latency_ms = max(1, round((perf_counter() - started) * 1000))
-        service.healthy = True
-        service.status = "running"
+        service.latency_ms = latency
+        service.healthy = reachable
+        service.status = "running" if reachable else "offline"
         db.commit()
         db.refresh(service)
-        return success(data=_service_payload(service), message="连接检查完成")
+        if not reachable:
+            return success(data=_service_payload(service),
+                           message=f"连接检查未通过：{reason}；服务已置为离线")
+        return success(data=_service_payload(service),
+                       message=f"连接检查通过：往返 {latency} 毫秒")
