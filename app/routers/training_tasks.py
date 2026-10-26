@@ -208,15 +208,15 @@ LLM_SETUP_SECRET = os.getenv("LLM_SETUP_SECRET", "")
 @router.post("/training-tasks/real")
 def create_real_training_task(request: CreateRealTrainingRequest,
                               authorization: str = Header(default="")):
-    """浏览器令牌透传给 8001 建迷你脚本任务，成功后登记同款台账。
+    """代理模型服务建迷你脚本任务，成功后登记同款台账。
 
-    模型服务按令牌隔离任务，因此建单必须使用浏览器自己的访问令牌；
+    建单优先使用本服务配置的模型服务令牌（环境变量 LLM_ACCESS_TOKEN），未配置时
+    退回透传浏览器头；平台登录令牌只用于 8000 网关，不再送往模型服务。
     X-Setup-Secret 只保存在本服务环境变量中，不进前端产物。
     """
     if not LLM_SETUP_SECRET:
         raise HTTPException(status_code=501, detail="未配置 LLM_SETUP_SECRET，无法代理真实训练建单")
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=422, detail="缺少模型服务访问令牌，请先在页签右侧配置令牌")
+    read_headers = _llm_read_headers(authorization)
     with SessionLocal() as db:
         try:
             model_id = int(request.model_id)
@@ -233,7 +233,7 @@ def create_real_training_task(request: CreateRealTrainingRequest,
             f"{LLM_TRAINING_BASE_URL}/script-tasks",
             json={"name": request.name.strip(), "script_id": "mini-mlp",
                   "parameters": {"epochs": request.epochs, "learning_rate": request.learning_rate}},
-            headers={"Authorization": authorization, "X-Setup-Secret": LLM_SETUP_SECRET},
+            headers={"Authorization": read_headers["Authorization"], "X-Setup-Secret": LLM_SETUP_SECRET},
             timeout=30,
         )
         if upstream.status_code >= 400:
@@ -241,7 +241,10 @@ def create_real_training_task(request: CreateRealTrainingRequest,
                 message = upstream.json().get("message") or upstream.text[:200]
             except ValueError:
                 message = upstream.text[:200]
-            raise HTTPException(status_code=upstream.status_code, detail=f"模型服务建单失败：{message}")
+            # 上游的"令牌无效/无权"是本服务与模型服务之间的配置问题，映射为 502，
+            # 避免前端把 401 一律当成平台登录过期而误踢用户下线。
+            status = 502 if upstream.status_code in {401, 403} else upstream.status_code
+            raise HTTPException(status_code=status, detail=f"模型服务建单失败：{message}")
         llm_task = upstream.json()["data"]
         now = now_shanghai()
         task = TrainingTask(
