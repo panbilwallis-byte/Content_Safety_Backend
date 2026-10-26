@@ -205,7 +205,19 @@ def _run_process_task(task_id: str, total: int):
                 "remaining_seconds": 0 if is_finished else PROCESS_TOTAL_SECONDS - elapsed,
             })
             if is_finished:
+                # 真规则执行（#13-1.4）：在写回 result 前调用，服务内部读 pending_output_version。
+                from app.services.process_execution import apply_process_rules
+                outcome = apply_process_rules(db, task)
                 result["output_version"] = result.pop("pending_output_version", None)
+                if outcome:
+                    result["comparisons"] = outcome["comparisons"]
+                    result["deduplicated_count"] = outcome["deduplicated_count"]
+                    result["derived_count"] = outcome["derived_count"]
+                    result["total_count"] = outcome["input_count"]
+                    if outcome.get("output_version_id"):
+                        result["output_version_id"] = outcome["output_version_id"]
+                        result["output_sample_count"] = outcome["output_sample_count"]
+                    task.duplicate_count = outcome["deduplicated_count"]
                 task.status = "succeeded"
                 task.finished_at = now_shanghai()
             task.result = result
