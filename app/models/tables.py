@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, Float, Integer, String, Text
+from sqlalchemy import JSON, DateTime, Float, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -227,7 +227,10 @@ class Model(Base):
 
 
 class DatasetRecord(Base):
-    """平台 MySQL 中保存的外部数据库原始数据行及其内容指纹。"""
+    """平台 MySQL 中保存的外部数据库原始数据行及其内容指纹。
+
+    内容只追加不修改：清洗派生新行并以 source_record_id 指回原件 (#13)。
+    """
 
     __tablename__ = "dataset_records"
 
@@ -235,6 +238,8 @@ class DatasetRecord(Base):
     dataset_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
     task_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    # 派生血缘：NULL=接入原件；非空=由哪条原件经哪个处理任务派生 (#13)。
+    source_record_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_shanghai, nullable=False)
 
@@ -764,3 +769,39 @@ class ComplianceEvent(Base):
     detail: Mapped[str] = mapped_column(Text, default="", nullable=False)
     trace_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_shanghai, nullable=False)
+
+
+class DatasetVersion(Base):
+    """数据集版本清单卡 (#13)：版本=对样本行的不可变引用集合，内容永不复制。
+
+    version_id 为对外稳定主键（dsv_000001），label 为人类版本号（v1.0.0）；
+    两者同时可被 resolve_version 解析，根治 dsv/版本字符串漂移。
+    """
+
+    __tablename__ = "dataset_versions"
+
+    version_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    dataset_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    label: Mapped[str] = mapped_column(String(100), nullable=False)
+    # 派生版本的上游（清洗前版本）；原始接入快照为 NULL。
+    source_version_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # 产出该版本的处理/接入任务。
+    producing_task_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    change_summary: Mapped[str] = mapped_column(String(500), default="", nullable=False)
+    sample_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # 清单指纹：sha256("record_id:content_hash\n" 按 record_id 排序拼接)。
+    manifest_hash: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_shanghai, nullable=False)
+
+
+class DatasetVersionItem(Base):
+    """版本↔样本行引用明细 (#13)：一行一个引用，谱系三元组与清单核对都数这张表。"""
+
+    __tablename__ = "dataset_version_items"
+    __table_args__ = (UniqueConstraint("version_id", "record_id", name="uq_version_record"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    version_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    record_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    # 快照当时的内容指纹，与 dataset_records.content_hash 对账用。
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)

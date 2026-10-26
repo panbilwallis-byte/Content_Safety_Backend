@@ -1,3 +1,7 @@
+from sqlalchemy import select
+
+from app.core.database import SessionLocal
+from app.models.tables import Dataset, DatasetVersion
 from app.services.resource_service import create_new_dataset
 
 from fastapi import APIRouter, HTTPException, Query
@@ -240,19 +244,34 @@ def get_dataset_detail(dataset_id: int):
 
 @router.get("/datasets/{dataset_id}/versions")
 def get_dataset_versions(dataset_id: int):
-    dataset = find_resource("datasets", dataset_id)
-    if dataset is None:
-        raise HTTPException(status_code=404, detail="数据集不存在")
+    """读取真实版本清单（#13）：id 为 dsv 主键、label 为版本号，附样本数与清单哈希。"""
+    with SessionLocal() as db:
+        dataset = db.get(Dataset, dataset_id)
+        if dataset is None:
+            raise HTTPException(status_code=404, detail="数据集不存在")
+        versions = db.scalars(
+            select(DatasetVersion)
+            .where(DatasetVersion.dataset_id == dataset_id)
+            .order_by(DatasetVersion.version_id)
+        ).all()
+        languages = (dataset.metadata_json or {}).get("languages", [])
+        items = [{
+            "id": version.version_id,
+            "label": version.label,
+            "languages": languages,
+            "sample_count": version.sample_count,
+            "manifest_hash": version.manifest_hash,
+            "source_version_id": version.source_version_id,
+            "producing_task_id": version.producing_task_id,
+            "change_summary": version.change_summary,
+            "created_at": version.created_at.isoformat(),
+        } for version in versions]
     return success(
         data={
-            "items": [{
-                "id": dataset["version_id"],
-                "label": dataset["version_id"],
-                "languages": dataset.get("languages", []),
-            }],
-            "total": 1,
+            "items": items,
+            "total": len(items),
             "page": 1,
-            "page_size": 1,
+            "page_size": max(len(items), 1),
             "total_pages": 1,
         },
         message="数据集版本查询成功",

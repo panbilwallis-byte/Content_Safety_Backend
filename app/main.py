@@ -50,6 +50,7 @@ from app.repositories.evaluation_repository import ensure_demo_evaluations
 from app.routers.training_tasks import ensure_trained_model_versions
 from app.routers.model_workbench import sync_model_call_tasks
 from app.services.compliance_service import seed_compliance_data
+from app.services.dataset_version_service import ensure_dataset_versions_backfill
 
 from fastapi.responses import JSONResponse
 
@@ -83,6 +84,7 @@ async def lifespan(app: FastAPI):
     ensure_user_passwords()
     ensure_task_columns()
     ensure_dataset_record_columns()
+    ensure_dataset_versions_backfill()
     ensure_model_columns()
     ensure_training_task_columns()
     # 迁移旧的统一资源表，并确保独立资源表有初始数据

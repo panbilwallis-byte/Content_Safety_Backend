@@ -13,6 +13,7 @@ from app.domain.capabilities import is_supported
 from app.domain.schemas import ExecuteTaskRequest
 from app.repositories.audit_repository import add_log
 from app.services.compliance_event_service import add_event
+from app.services.dataset_version_service import refresh_raw_version
 from app.repositories.evaluation_repository import save_evaluation
 from app.repositories.resource_repository import (
     find_metric,
@@ -159,6 +160,8 @@ def _sync_ingested_dataset(
     metadata["quality_score"] = float(metadata.get("quality_score", 95) or 95)
     dataset.metadata_json = metadata
     dataset.status = "ready"
+    # 原始接入快照随接入滚动更新，清单哈希暴露样本集漂移 (#13)。
+    refresh_raw_version(db, dataset)
     db.flush()
     return dataset
 

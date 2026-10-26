@@ -249,6 +249,15 @@ def ensure_dataset_record_columns():
             connection.execute(text(
                 "CREATE INDEX ix_dataset_records_content_hash ON dataset_records (content_hash)"
             ))
+    if "source_record_id" not in columns:
+        # 派生血缘列 (#13)：接入原件为 NULL，清洗派生行指回原件。
+        with engine.begin() as connection:
+            connection.execute(text(
+                "ALTER TABLE dataset_records ADD COLUMN source_record_id INTEGER NULL"
+            ))
+            connection.execute(text(
+                "CREATE INDEX ix_dataset_records_source_record_id ON dataset_records (source_record_id)"
+            ))
 
 
 def ensure_model_columns():
