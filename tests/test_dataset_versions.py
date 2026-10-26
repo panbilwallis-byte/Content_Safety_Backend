@@ -5,13 +5,22 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.models.tables import Base, Dataset, DatasetRecord, DatasetVersion, DatasetVersionItem
+from app.models.tables import (
+    Base,
+    ComplianceLineageEdge,
+    Dataset,
+    DatasetRecord,
+    DatasetVersion,
+    DatasetVersionItem,
+)
 from app.services.dataset_version_service import (
     manifest_hash,
+    purge_dataset_ledger,
     refresh_raw_version,
     register_version,
     resolve_version,
 )
+from app.services.lineage_service import record_ingest_edge
 
 
 class DatasetVersionServiceTest(unittest.TestCase):
@@ -113,6 +122,17 @@ class DatasetVersionServiceTest(unittest.TestCase):
         newest = register_version(self.db, self.dataset, "v1.3.0")
         self.db.commit()
         self.assertEqual(newest.version_id, "dsv_000004")
+
+    def test_purge_dataset_ledger_leaves_no_orphan_manifest_or_edge(self):
+        refresh_raw_version(self.db, self.dataset, "TR-ING-1")
+        record_ingest_edge(self.db, task_id="TR-ING-1", dataset=self.dataset)
+        self.db.commit()
+        purge_dataset_ledger(self.db, self.dataset.id)
+        self.db.commit()
+        self.assertEqual(self.db.scalars(select(DatasetVersion)).all(), [])
+        self.assertEqual(self.db.scalars(select(DatasetVersionItem)).all(), [])
+        self.assertEqual(self.db.scalars(select(ComplianceLineageEdge)).all(), [])
+        self.assertEqual(len(self.db.scalars(select(DatasetRecord)).all()), 3)  # 内容行由调用方决定去留
 
 
 if __name__ == "__main__":

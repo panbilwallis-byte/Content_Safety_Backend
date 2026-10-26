@@ -26,7 +26,7 @@ from sqlalchemy import delete, select
 from app.core.database import SessionLocal
 from app.core.time import now_shanghai
 from app.models.tables import Dataset, DatasetRecord, Task
-from app.services.dataset_version_service import refresh_raw_version
+from app.services.dataset_version_service import purge_dataset_ledger, refresh_raw_version
 from app.services.lineage_service import record_ingest_edge
 
 DATASET_NAME = "大模型安全反例库"
@@ -89,6 +89,7 @@ def main() -> int:
                   "如需覆盖重导请加 --reset")
             return 1
         if existing and args.reset:
+            purge_dataset_ledger(db, existing.id)
             db.execute(delete(DatasetRecord).where(DatasetRecord.dataset_id == existing.id))
             db.delete(existing)
             db.flush()

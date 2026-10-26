@@ -7,10 +7,16 @@ from __future__ import annotations
 
 import hashlib
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.orm import Session
 
-from app.models.tables import Dataset, DatasetRecord, DatasetVersion, DatasetVersionItem
+from app.models.tables import (
+    ComplianceLineageEdge,
+    Dataset,
+    DatasetRecord,
+    DatasetVersion,
+    DatasetVersionItem,
+)
 
 
 def next_version_id(db: Session) -> str:
@@ -104,6 +110,23 @@ def refresh_raw_version(db: Session, dataset: Dataset, task_id: str | None = Non
     version.change_summary = "接入滚动更新：{}".format(task_id or "启动补登")
     db.flush()
     return version
+
+
+def purge_dataset_ledger(db: Session, dataset_id: int) -> None:
+    """覆盖式重导前清空该数据集的版本清单与相关谱系边——当作从未接入过，不留指向空集的黑户。"""
+    version_ids = [row.version_id for row in db.scalars(
+        select(DatasetVersion).where(DatasetVersion.dataset_id == dataset_id)).all()]
+    if version_ids:
+        db.execute(delete(DatasetVersionItem).where(DatasetVersionItem.version_id.in_(version_ids)))
+        db.execute(delete(ComplianceLineageEdge).where(or_(
+            (ComplianceLineageEdge.from_type == "dataset_version")
+            & ComplianceLineageEdge.from_id.in_(version_ids),
+            (ComplianceLineageEdge.to_type == "dataset_version")
+            & ComplianceLineageEdge.to_id.in_(version_ids))))
+        db.execute(delete(DatasetVersion).where(DatasetVersion.version_id.in_(version_ids)))
+    db.execute(delete(ComplianceLineageEdge).where(or_(
+        (ComplianceLineageEdge.from_type == "dataset") & (ComplianceLineageEdge.from_id == str(dataset_id)),
+        (ComplianceLineageEdge.to_type == "dataset") & (ComplianceLineageEdge.to_id == str(dataset_id)))))
 
 
 def ensure_dataset_versions_backfill() -> None:
