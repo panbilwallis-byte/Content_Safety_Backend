@@ -7,7 +7,7 @@ from uuid import uuid4
 import httpx
 from fastapi import Header
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query, Response
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -267,6 +267,68 @@ def create_real_training_task(request: CreateRealTrainingRequest,
         payload = training_task_payload(task)
         payload["llm_task_id"] = llm_task["id"]
         return success(data=payload, message="真实训练任务已创建，等待模型服务执行")
+
+
+LLM_ACCESS_TOKEN = os.getenv("LLM_ACCESS_TOKEN", "")
+
+
+def _llm_read_headers(authorization: str) -> dict:
+    # 优先用本服务配置的模型令牌；未配置时退回透传浏览器令牌，保持旧行为可用。
+    token = LLM_ACCESS_TOKEN or (authorization[7:] if authorization.startswith("Bearer ") else "")
+    if not token:
+        raise HTTPException(status_code=422, detail="未配置模型服务访问令牌（环境变量 LLM_ACCESS_TOKEN）")
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _llm_read(url: str, params: dict, authorization: str):
+    upstream = httpx.get(url, params=params, headers=_llm_read_headers(authorization), timeout=30)
+    if upstream.status_code >= 400:
+        try:
+            message = upstream.json().get("message") or upstream.text[:200]
+        except ValueError:
+            message = upstream.text[:200]
+        raise HTTPException(status_code=upstream.status_code, detail=f"模型服务：{message}")
+    return success(data=upstream.json()["data"])
+
+
+@router.get("/training-tasks/{task_id}/detail")
+def proxy_training_detail(task_id: str, authorization: str = Header(default="")):
+    """台账只读代理：任务详情。浏览器无需持有模型服务令牌。"""
+    return _llm_read(f"{LLM_TRAINING_BASE_URL}/tasks/{task_id}", {}, authorization)
+
+
+@router.get("/training-tasks/{task_id}/metrics")
+def proxy_training_metrics(task_id: str, after_id: int = Query(0, ge=0),
+                           limit: int = Query(1000, ge=1, le=1000),
+                           authorization: str = Header(default="")):
+    """台账只读代理：逐 step 训练指标（游标增量）。"""
+    return _llm_read(f"{LLM_TRAINING_BASE_URL}/tasks/{task_id}/metrics",
+                     {"after_id": after_id, "limit": limit}, authorization)
+
+
+@router.get("/training-tasks/{task_id}/artifacts")
+def proxy_training_artifacts(task_id: str, authorization: str = Header(default="")):
+    """台账只读代理：真实产物清单（文件名/大小/SHA-256）。"""
+    return _llm_read(f"{LLM_TRAINING_BASE_URL}/tasks/{task_id}/artifacts", {}, authorization)
+
+
+@router.get("/training-tasks/{task_id}/artifacts/{artifact_id}/download")
+def proxy_training_artifact_download(task_id: str, artifact_id: str,
+                                     authorization: str = Header(default="")):
+    """台账只读代理：产物原始字节流下载。"""
+    upstream = httpx.get(
+        f"{LLM_TRAINING_BASE_URL}/tasks/{task_id}/artifacts/{artifact_id}/download",
+        headers=_llm_read_headers(authorization), timeout=120, follow_redirects=True)
+    if upstream.status_code >= 400:
+        try:
+            message = upstream.json().get("message") or upstream.text[:200]
+        except ValueError:
+            message = upstream.text[:200]
+        raise HTTPException(status_code=upstream.status_code, detail=f"模型服务：{message}")
+    disposition = upstream.headers.get("content-disposition", "")
+    return Response(content=upstream.content,
+                    media_type=upstream.headers.get("content-type", "application/octet-stream"),
+                    headers={"Content-Disposition": disposition or f'attachment; filename="{artifact_id}"'})
 
 
 @router.post("/training-tasks/{task_id}/sync")
