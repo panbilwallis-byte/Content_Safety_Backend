@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from math import ceil
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -17,6 +17,7 @@ from app.models.tables import (
     ComplianceAudit,
     ComplianceEvidence,
     ComplianceErrorComment,
+    ComplianceLineageEdge,
     Dataset,
     Model,
     ModelCall,
@@ -25,6 +26,7 @@ from app.models.tables import (
     TrainingTask,
 )
 from app.services.compliance_service import alert_payload, audit_payload, ensure_compliance_data, subject
+from app.services.lineage_service import ledger_summary
 from uuid import uuid4
 
 
@@ -383,6 +385,42 @@ def lineage(entity_type: str, entity_id: str, version_id: str | None = None,
     gaps = [{"reason": edge["missing_reason"] or "谱系关系缺少核验依据", "evidence_refs": edge["evidence_refs"], "alert_id": None}
             for edge in selected_edges if edge["verification_state"] == "missing"]
     return success(data={"nodes": [node for node in nodes if node["id"] in ids], "edges": selected_edges, "gaps": gaps}, message="谱系查询成功")
+
+
+@router.get("/compliance/lineage/edges")
+def lineage_edges(relation: str | None = None, export: str | None = Query(None, pattern="^(csv|json)$"),
+                  db: Session = Depends(get_db)):
+    """谱系边台账（XN-008）：动作真实发生时登记过的 起点→关系→终点 三元组，可按关系筛选、导出 CSV。
+
+    谱系图回答"现在接没接上"，这张台账回答"当时确实接上过"——边由接入/清洗/训练/调用四个
+    执行点写入并幂等去重，未登记的端点不会补造，所以计数只含真实核验过的关系。
+    """
+    rows = list(db.scalars(select(ComplianceLineageEdge)
+                           .order_by(ComplianceLineageEdge.created_at.desc(),
+                                     ComplianceLineageEdge.id)).all())
+    summary = ledger_summary(db)
+    items = []
+    for row in rows:
+        payload = dict(row.payload or {})
+        if relation and payload.get("relation") != relation:
+            continue
+        items.append({
+            "id": row.id,
+            "from_type": row.from_type, "from_id": row.from_id,
+            "to_type": row.to_type, "to_id": row.to_id,
+            "relation": payload.get("relation", ""),
+            "detail": {key: value for key, value in payload.items() if key != "relation"},
+            "created_at": row.created_at.isoformat(),
+        })
+    if export == "csv":
+        header = "id,from_type,from_id,relation,to_type,to_id,created_at"
+        lines = [header] + ["{},{},{},{},{},{},{}".format(
+            item["id"], item["from_type"], item["from_id"], item["relation"],
+            item["to_type"], item["to_id"], item["created_at"]) for item in items]
+        return Response(content="\r\n".join(lines) + "\r\n", media_type="text/csv",
+                        headers={"Content-Disposition": 'attachment; filename="lineage-edges.csv"'})
+    return success(data={"total": summary["total"], "byRelation": summary["byRelation"],
+                         "matched": len(items), "items": items}, message="谱系边台账查询成功")
 
 
 @router.get("/compliance/audits")

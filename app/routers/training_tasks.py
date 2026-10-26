@@ -17,6 +17,7 @@ from app.core.time import now_shanghai
 from app.domain.schemas import CreateTrainingTaskRequest, CreateRealTrainingRequest, SyncTrainingTaskRequest
 from app.models.tables import Dataset, Model, ModelVersion, TrainingTask
 from app.services.compliance_event_service import add_event
+from app.services.lineage_service import record_training_edges
 
 
 router = APIRouter()
@@ -74,19 +75,23 @@ def register_trained_version(db: Session, task: TrainingTask) -> None:
     model = db.get(Model, model_id)
     if model is None or not task.target_version:
         return
-    exists = db.scalar(
+    version_row = db.scalar(
         select(ModelVersion).where(
             ModelVersion.model_id == model_id,
             ModelVersion.version == task.target_version,
         )
     )
-    if exists is None:
-        db.add(ModelVersion(
+    if version_row is None:
+        version_row = ModelVersion(
             model_id=model_id,
             version=task.target_version,
             description=f"由训练任务「{task.name}」（{task.id}）产出",
             task_id=task.id,
-        ))
+        )
+        db.add(version_row)
+        db.flush()
+    # 产物版本行确实登记后才写谱系边；数据清单未登记时只写产物这一条 (#13-1.6)。
+    record_training_edges(db, task, version_row)
     # 仅当基础版本仍是当前版本时才前移指针，避免用旧任务把新版本改回去。
     if model.version == task.base_version:
         model.version = task.target_version

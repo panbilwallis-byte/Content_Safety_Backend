@@ -103,6 +103,17 @@ class DatasetVersionServiceTest(unittest.TestCase):
         self.db.commit()
         self.assertEqual(version.sample_count, 3)  # 派生行不进原始快照
 
+    def test_version_id_survives_deleted_middle_row(self):
+        for label in ("v1.0.0", "v1.1.0", "v1.2.0"):
+            register_version(self.db, self.dataset, label)
+        self.db.commit()
+        self.db.delete(self.db.get(DatasetVersion, "dsv_000001"))
+        self.db.commit()
+        # 表里只剩两行；若按“行数+1”发号会重发已存在的 dsv_000002 并撞主键。
+        newest = register_version(self.db, self.dataset, "v1.3.0")
+        self.db.commit()
+        self.assertEqual(newest.version_id, "dsv_000004")
+
 
 if __name__ == "__main__":
     unittest.main()

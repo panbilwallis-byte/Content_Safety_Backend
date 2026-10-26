@@ -14,6 +14,7 @@ from app.domain.schemas import ExecuteTaskRequest
 from app.repositories.audit_repository import add_log
 from app.services.compliance_event_service import add_event
 from app.services.dataset_version_service import refresh_raw_version
+from app.services.lineage_service import record_ingest_edge
 from app.repositories.evaluation_repository import save_evaluation
 from app.repositories.resource_repository import (
     find_metric,
@@ -160,8 +161,6 @@ def _sync_ingested_dataset(
     metadata["quality_score"] = float(metadata.get("quality_score", 95) or 95)
     dataset.metadata_json = metadata
     dataset.status = "ready"
-    # 原始接入快照随接入滚动更新，清单哈希暴露样本集漂移 (#13)。
-    refresh_raw_version(db, dataset)
     db.flush()
     return dataset
 
@@ -460,6 +459,10 @@ def run_mock_task(
                         ),
                     )
                     result["duplicate_count"] = duplicate_count
+                # 原件行全部落库后才冻结原始清单快照，样本数与清单哈希才与本次接入一致 (#13)；
+                # 随后把"任务→数据集/清单"写进谱系边台账 (#13-1.6)。
+                refresh_raw_version(db, dataset, task_id=task_id)
+                record_ingest_edge(db, task_id=task_id, dataset=dataset)
                 result["dataset_id"] = dataset.id
                 result["dataset_name"] = dataset.name
 

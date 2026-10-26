@@ -51,6 +51,7 @@ from app.routers.training_tasks import ensure_trained_model_versions
 from app.routers.model_workbench import sync_model_call_tasks
 from app.services.compliance_service import seed_compliance_data
 from app.services.dataset_version_service import ensure_dataset_versions_backfill
+from app.services.lineage_service import ensure_lineage_edges_backfill
 
 from fastapi.responses import JSONResponse
 
@@ -108,6 +109,8 @@ async def lifespan(app: FastAPI):
     with SessionLocal() as db:
         if sync_model_call_tasks(db):
             db.commit()
+    # 谱系边台账补登：把已登记的接入/清洗/训练/调用关系写成边，重启不翻倍 (#13-1.6)。
+    ensure_lineage_edges_backfill()
 
     print("MySQL 数据表初始化完成")
     yield

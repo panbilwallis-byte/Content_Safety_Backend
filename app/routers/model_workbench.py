@@ -10,6 +10,7 @@ from app.core.response import success
 from app.core.time import now_shanghai
 from app.domain.schemas import RegisterModelServiceRequest, UpgradeModelServiceRequest, RecordModelCallRequest
 from app.services.compliance_event_service import add_event
+from app.services.lineage_service import record_call_edge
 from app.models.tables import Dataset, Model, ModelVersion, ModelService, ModelCall, TrainingTask, Task
 from app.routers.training_tasks import advance_training_task, training_task_payload
 
@@ -377,6 +378,7 @@ def record_model_call(request: RecordModelCallRequest):
         # 会话是 autoflush=False：必须先把新调用行落进事务，补挂查询才看得见它，
         # 否则本端点每次空转、只能等服务重启回填（历史缺陷回归，见 tests/test_model_call_sync.py）。
         db.flush()
+        record_call_edge(db, call)
         sync_model_call_tasks(db)
         db.commit()
         return success(data={"id": call.id}, message="调用留痕已登记")

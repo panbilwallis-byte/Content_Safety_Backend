@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 
 from app.models.tables import Dataset, DatasetRecord, DatasetVersionItem, Task
 from app.services.dataset_version_service import register_version, resolve_version
+from app.services.lineage_service import record_process_edges
 
 TRANSFORM_RULES = {"normalize_text", "normalize_encoding"}
 
@@ -126,6 +127,13 @@ def apply_process_rules(db: Session, task: Task) -> dict | None:
             db, dataset, str(output_label), final_ids,
             source_version_id=source_version.version_id if source_version else None,
             producing_task_id=task.task_id, change_summary=summary)
+        record_process_edges(
+            db, task_id=task.task_id,
+            source_version_id=out_version.source_version_id,
+            output_version_id=out_version.version_id,
+            sample_count=out_version.sample_count,
+            manifest_hash=out_version.manifest_hash,
+            change_summary=summary)
         version_info = {"output_version_id": out_version.version_id,
                         "output_sample_count": out_version.sample_count}
     return {

@@ -7,15 +7,20 @@ from __future__ import annotations
 
 import hashlib
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from app.models.tables import Dataset, DatasetRecord, DatasetVersion, DatasetVersionItem
 
 
 def next_version_id(db: Session) -> str:
-    count = db.scalar(select(func.count()).select_from(DatasetVersion)) or 0
-    return "dsv_{:06d}".format(count + 1)
+    """清单卡主键：现有 dsv_ 编号的最大值 +1。
+
+    不能用行数 +1——中间删过一条就会把已存在的编号再发一次，撞主键。
+    """
+    largest = max((int(row[4:]) for row in db.scalars(select(DatasetVersion.version_id)).all()
+                   if row.startswith("dsv_") and row[4:].isdigit()), default=0)
+    return "dsv_{:06d}".format(largest + 1)
 
 
 def manifest_hash(pairs) -> str:
@@ -111,7 +116,12 @@ def ensure_dataset_versions_backfill() -> None:
             exists = db.scalar(select(DatasetVersion)
                                .where(DatasetVersion.dataset_id == dataset.id).limit(1))
             if exists is None:
-                register_version(db, dataset, dataset.version or "v1.0.0",
+                # 与 refresh_raw_version 同口径：启动补登只收原件行，清洗派生行不进原始快照 (#13)。
+                raw_ids = list(db.scalars(select(DatasetRecord.id)
+                               .where(DatasetRecord.dataset_id == dataset.id,
+                                      DatasetRecord.source_record_id.is_(None))
+                               .order_by(DatasetRecord.id)).all())
+                register_version(db, dataset, dataset.version or "v1.0.0", raw_ids,
                                  change_summary="原始接入快照（启动补登）")
                 changed = True
         if changed:
