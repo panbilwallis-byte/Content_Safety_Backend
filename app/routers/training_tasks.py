@@ -210,6 +210,18 @@ LLM_TRAINING_BASE_URL = os.getenv("LLM_TRAINING_BASE_URL", "http://127.0.0.1:800
 LLM_SETUP_SECRET = os.getenv("LLM_SETUP_SECRET", "")
 
 
+REAL_SCRIPTS = {
+    # 平台可代为建单的真实训练脚本：脚本 ID -> (中文名, 参数组装)。
+    # 参数上下界由模型服务侧的 Pydantic 再校验一遍，这里只负责按脚本口径组装载荷。
+    "mini-mlp": ("迷你 MLP（合成数据）", lambda request: {
+        "epochs": request.epochs, "learning_rate": request.learning_rate}),
+    "fashion-cnn": ("FashionMNIST 小型 CNN", lambda request: {
+        "epochs": request.epochs, "learning_rate": request.learning_rate,
+        "batch_size": request.batch_size,
+        **({"train_samples": request.train_samples} if request.train_samples else {})}),
+}
+
+
 @router.post("/training-tasks/real")
 def create_real_training_task(request: CreateRealTrainingRequest,
                               authorization: str = Header(default="")):
@@ -234,10 +246,16 @@ def create_real_training_task(request: CreateRealTrainingRequest,
         dataset = db.get(Dataset, dataset_id)
         if dataset is None:
             raise HTTPException(status_code=404, detail="训练数据集不存在")
+        if request.script_id not in REAL_SCRIPTS:
+            raise HTTPException(
+                status_code=422,
+                detail="暂不支持的真实训练脚本：" + request.script_id
+                       + "；可选 " + "、".join(REAL_SCRIPTS))
+        script_label, script_parameters = REAL_SCRIPTS[request.script_id]
         upstream = httpx.post(
             f"{LLM_TRAINING_BASE_URL}/script-tasks",
-            json={"name": request.name.strip(), "script_id": "mini-mlp",
-                  "parameters": {"epochs": request.epochs, "learning_rate": request.learning_rate}},
+            json={"name": request.name.strip(), "script_id": request.script_id,
+                  "parameters": script_parameters(request)},
             headers={"Authorization": read_headers["Authorization"], "X-Setup-Secret": LLM_SETUP_SECRET},
             timeout=30,
         )
@@ -264,7 +282,8 @@ def create_real_training_task(request: CreateRealTrainingRequest,
         db.add(task)
         add_event(db, subject_type="training_task", subject_id=task.id, training_task_id=task.id,
                   event_type="训练任务启动",
-                  detail=f"{task.name}：真实脚本 mini-mlp，模型 {model.name} {task.base_version}，"
+                  detail=f"{task.name}：真实脚本 {request.script_id}（{script_label}），"
+                         f"模型 {model.name} {task.base_version}，"
                          f"数据集 {dataset.name} {task.dataset_version}，{task.epochs} 轮 · {task.method}")
         if (dataset.metadata_json or {}).get("usage") == "test":
             add_event(db, subject_type="training_task", subject_id=task.id, training_task_id=task.id,

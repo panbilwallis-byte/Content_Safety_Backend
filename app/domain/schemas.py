@@ -175,6 +175,9 @@ class CreateRealTrainingRequest(BaseModel):
     batch_size: int = Field(ge=1, le=256)
     target_version: str = Field(min_length=1, max_length=100)
     method: str = Field(default="低秩适配微调", min_length=1, max_length=64)
+    # 真实训练脚本白名单见 REAL_SCRIPTS；CIFAR 等重任务请直接在模型服务侧建单。
+    script_id: str = Field(default="mini-mlp", min_length=1, max_length=64)
+    train_samples: int | None = Field(default=None, ge=100, le=60000)
 
 
 class SyncTrainingTaskRequest(BaseModel):
