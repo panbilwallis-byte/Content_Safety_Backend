@@ -374,6 +374,9 @@ def record_model_call(request: RecordModelCallRequest):
                       event_type="模型输出异常告警", level=call.risk_level,
                       detail=call.reason or "输出风险判定命中，但未返回判定依据",
                       trace_id=call.trace_id)
+        # 会话是 autoflush=False：必须先把新调用行落进事务，补挂查询才看得见它，
+        # 否则本端点每次空转、只能等服务重启回填（历史缺陷回归，见 tests/test_model_call_sync.py）。
+        db.flush()
         sync_model_call_tasks(db)
         db.commit()
         return success(data={"id": call.id}, message="调用留痕已登记")
