@@ -12,7 +12,16 @@ from app.core.time import now_shanghai
 from app.domain.schemas import RegisterModelServiceRequest, UpgradeModelServiceRequest, RecordModelCallRequest
 from app.services.compliance_event_service import add_event
 from app.services.lineage_service import record_call_edge
-from app.models.tables import Dataset, Model, ModelVersion, ModelService, ModelCall, TrainingTask, Task
+from app.models.tables import (
+    Dataset,
+    DatasetVersion,
+    Model,
+    ModelVersion,
+    ModelService,
+    ModelCall,
+    TrainingTask,
+    Task,
+)
 from app.routers.training_tasks import advance_training_task, training_task_payload
 
 router = APIRouter()
@@ -139,6 +148,29 @@ def _model_payload(model: Model, versions: list[ModelVersion], edit_task_map: di
     }
 
 
+def _dataset_versions_payload(
+    dataset: Dataset, version_map: dict[int, list[DatasetVersion]]
+) -> list[dict]:
+    """数据集版本选项：版本表有记录则全部下发；为空时兜底主表当前版本，避免下拉为空。"""
+    items = version_map.get(dataset.id, [])
+    if items:
+        return [
+            {
+                "version": item.label,
+                "version_id": item.version_id,
+                "sample_count": item.sample_count,
+                "change_summary": item.change_summary,
+            }
+            for item in items
+        ]
+    return [{
+        "version": dataset.version,
+        "version_id": None,
+        "sample_count": int((dataset.metadata_json or {}).get("record_count", 0) or 0),
+        "change_summary": "",
+    }]
+
+
 @router.get("/model-workbenches/current")
 def current_model_workbench():
     """模型训推页面的数据库聚合读取接口。"""
@@ -161,6 +193,13 @@ def current_model_workbench():
         for version in versions:
             version_map.setdefault(version.model_id, []).append(version)
         datasets = list(db.scalars(select(Dataset).order_by(Dataset.id.desc())).all())
+        # 数据集版本清单（#13）随聚合接口一并下发，训练弹窗版本下拉无需再单独请求。
+        dataset_versions = list(
+            db.scalars(select(DatasetVersion).order_by(DatasetVersion.version_id)).all()
+        )
+        dataset_version_map: dict[int, list[DatasetVersion]] = {}
+        for item in dataset_versions:
+            dataset_version_map.setdefault(item.dataset_id, []).append(item)
         assessments = list(db.scalars(select(Task).where(Task.capability_code == "evaluation").order_by(Task.created_at.desc())).all())
         edit_tasks = list(db.scalars(select(Task).where(Task.capability_code == "knowledge_edit").order_by(Task.created_at.desc())).all())
         latest_edit = edit_tasks[0] if edit_tasks else None
@@ -199,6 +238,7 @@ def current_model_workbench():
                     # 训练弹窗按 purpose=training 筛选、评估页按 purpose=evaluation 筛选；
                     # 用途存在 metadata_json.purpose，缺省视为训练集。
                     "purpose": (dataset.metadata_json or {}).get("purpose", "training"),
+                    "versions": _dataset_versions_payload(dataset, dataset_version_map),
                 }
                 for dataset in datasets
             ],

@@ -139,9 +139,56 @@ def _process_task_summary(task: dict) -> dict:
         "finished_at": task.get("finished_at"), "trace_id": task.get("trace_id"),
     }
 
+def _resolve_process_version_refs(input_data: dict, result: dict) -> tuple[str | None, str | None]:
+    """把版本的“人类可读标签”和“数据库 dsv ID”都补齐给详情接口。
+
+    返回 (输入版本标签, 输出版本 dsv ID)。解析依赖 dataset_versions 清单：
+    - 输入引用可能是 dsv 主键或 v1.0.0 标签，resolve_version 两种都认；
+    - 输出版本优先取执行时登记的 output_version_id，旧任务只有标签时
+      再按 (数据集, 标签) 反查清单；查不到就返回 None，由前端显示占位。
+    """
+    dataset_id = input_data.get("dataset_id") or input_data.get("datasetId")
+    input_ref = (
+        input_data.get("version_id") or input_data.get("versionId")
+        or input_data.get("dataset_version_id") or input_data.get("datasetVersionId")
+    )
+    output_label = result.get("output_version")
+    output_id = result.get("output_version_id")
+    input_label = None
+    if dataset_id is None:
+        return input_label, output_id
+    try:
+        dataset_number = int(dataset_id)
+    except (TypeError, ValueError):
+        return input_label, output_id
+    from sqlalchemy import select
+
+    from app.models.tables import Dataset, DatasetVersion
+    from app.services.dataset_version_service import resolve_version
+
+    with SessionLocal() as db:
+        dataset = db.get(Dataset, dataset_number)
+        if dataset is None:
+            return input_label, output_id
+        if input_ref:
+            source_version = resolve_version(db, dataset.id, str(input_ref))
+            if source_version is not None:
+                input_label = source_version.label
+        if not output_id and output_label:
+            output_version = db.scalar(select(DatasetVersion).where(
+                DatasetVersion.dataset_id == dataset.id,
+                DatasetVersion.label == str(output_label)))
+            if output_version is not None:
+                output_id = output_version.version_id
+    return input_label, output_id
+
+
 def _process_task(task: dict) -> dict:
-    input_data = task.get("input") or {}
+    input_data = dict(task.get("input") or {})
     result = task.get("result") or {}
+    input_version_label, output_version_id = _resolve_process_version_refs(input_data, result)
+    if input_version_label:
+        input_data["dataset_version_label"] = input_version_label
     total = int(result.get("total_count") or task.get("success_count") or 0)
     return {
         "task_id": task["task_id"], "name": task["name"],
@@ -149,6 +196,7 @@ def _process_task(task: dict) -> dict:
         "input": input_data,
         "rule_name": input_data.get("template_id") or input_data.get("templateId") or "数据处理",
         "output_version": result.get("output_version"),
+        "output_version_id": output_version_id,
         "status": task["status"], "progress": task["progress"],
         "processed_count": task.get("success_count") or 0,
         "total_count": total, "remaining_seconds": result.get("remaining_seconds"),

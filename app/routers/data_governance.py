@@ -732,13 +732,32 @@ def risk_overview(kind: str = Query(default="governance-risk")):
         reverse=True,
     )
     latest = results[0] if results else None
+    # 版本固定列展示人类版本号（v1.0.0），用版本表把 dsv 主键解析成 label；
+    # 历史数据若直接存了版本号，解析不到则原样显示，避免出现空白。
+    with SessionLocal() as db:
+        version_labels = {
+            row.version_id: row.label for row in db.scalars(select(DatasetVersion)).all()
+        }
     cards = [
         {"label": "已检测样本", "value": sum(int(result.get("valid_count") or 0) for result in results), "icon": "Document"},
         {"label": "风险样本", "value": latest["risk_count"] if latest else 0, "icon": "WarningFilled"},
         {"label": "高风险样本", "value": latest["high_count"] if latest else 0, "icon": "CircleCloseFilled"},
         {"label": "待人工复核", "value": latest["pending_count"] if latest else 0, "icon": "User"},
     ]
-    records = [{"result_id": result["id"], "dataset_name": result["dataset_name"], "version_id": result["scope"]["version_id"], "valid_count": result["valid_count"], "risk_count": result["risk_count"], "finished_at": result["finished_at"]} for result in results]
+    records = [
+        {
+            "result_id": result["id"],
+            "dataset_name": result["dataset_name"],
+            "version_id": result["scope"]["version_id"],
+            "version_label": version_labels.get(
+                result["scope"]["version_id"], result["scope"]["version_id"]
+            ),
+            "valid_count": result["valid_count"],
+            "risk_count": result["risk_count"],
+            "finished_at": result["finished_at"],
+        }
+        for result in results
+    ]
     return success(data={"cards": cards, "definitions": ["统计数据库中已完成的风险检测任务；服务重启后会恢复历史累计值。"], "records": records}, message="风险识别概览查询成功")
 
 
