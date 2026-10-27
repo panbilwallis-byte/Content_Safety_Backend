@@ -90,6 +90,9 @@ class ProcessExecutionTest(unittest.TestCase):
         first = outcome["comparisons"][0]
         self.assertEqual({"id", "original", "processed", "actions", "fields"} - set(first), set())
         self.assertTrue(all(field["before"] != field["after"] for field in first["fields"]))
+        # 前端按该 ID 回查版本清单并逐字比对原文：必须是真实记录号与完整文本。
+        self.assertEqual(first["id"], str(self.ids[0]))
+        self.assertEqual(first["original"], "ＡＢＣ　全角数据")
 
     def test_no_rules_keeps_rows_untouched(self):
         outcome = apply_process_rules(self.db, self._task([]))

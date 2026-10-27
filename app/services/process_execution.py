@@ -107,9 +107,10 @@ def apply_process_rules(db: Session, task: Task) -> dict | None:
             final_ids.append(derived.id)
             derived_count += 1
             comparisons.append({
-                "id": "R-{}".format(row.id),
-                "original": original_text[:120],
-                "processed": new_text[:120],
+                # 前端会按该 ID 回查版本清单并逐字比对原文，必须使用真实记录号与完整文本。
+                "id": str(row.id),
+                "original": original_text,
+                "processed": new_text,
                 "actions": actions,
                 "fields": fields,
             })

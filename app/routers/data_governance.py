@@ -6,7 +6,7 @@ from fastapi import APIRouter, Body, HTTPException, Query, Request
 from app.core.response import success
 from app.core.database import SessionLocal
 from app.core.time import now_shanghai
-from app.models.tables import Dataset, Task
+from app.models.tables import Dataset, DatasetRecord, DatasetVersion, DatasetVersionItem, Task
 from sqlalchemy import select
 
 router = APIRouter()
@@ -517,7 +517,26 @@ def governance_resource_samples(dataset_id: int, version_id: str, request: Reque
     if not wanted_ids:
         return success(data=[], message="数据集样本查询成功")
 
+    # #13：版本清单内的原始记录可直接按 ID 回查（数据处理对比校验与后续版本核对共用此路径）。
     samples = []
+    with SessionLocal() as db:
+        version = db.scalar(select(DatasetVersion).where(
+            DatasetVersion.dataset_id == dataset_id,
+            (DatasetVersion.version_id == version_id) | (DatasetVersion.label == version_id)))
+        numeric_ids = {int(item) for item in wanted_ids if str(item).isdigit()}
+        if version is not None and numeric_ids:
+            rows = db.execute(
+                select(DatasetRecord.id, DatasetRecord.payload)
+                .join(DatasetVersionItem, DatasetVersionItem.record_id == DatasetRecord.id)
+                .where(DatasetVersionItem.version_id == version.version_id,
+                       DatasetRecord.id.in_(numeric_ids))
+                .order_by(DatasetRecord.id)).all()
+            samples = [
+                {"id": str(record_id),
+                 "text": str((payload or {}).get("text") or ""),
+                 "language": str((payload or {}).get("language") or ""),
+                 "dataset_id": dataset_id, "version_id": version_id}
+                for record_id, payload in rows]
     for task in _tasks(("anomaly_detect",)):
         task_scope = _anomaly_scope(task.input_data or {})
         if (
