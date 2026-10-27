@@ -619,13 +619,12 @@ def ensure_ingest_demo_tasks():
 
 
 def ensure_process_demo_tasks():
-    """补充数据治理页所需的数据处理任务，供页面直接从 tasks 表汇总读取。"""
+    """补充数据治理页所需的数据处理任务，供页面直接从 tasks 表汇总读取。
+
+    只种不带输出版本的失败/进行中样例：曾经的 demo_01~05 只把版本名写进
+    result.output_version、从未登记版本快照，会在谱系里画出查不到的"幽灵版本"。
+    """
     task_seeds = [
-        ("tsk_process_demo_01", "社交媒体语料标准清洗", "社交媒体中文语料库", "succeeded", 100, 186_420, "v1.1.0"),
-        ("tsk_process_demo_02", "多模态样本格式规范化", "多模态内容安全样本集", "succeeded", 100, 124_680, "v1.1.0"),
-        ("tsk_process_demo_03", "行业风险数据去重补全", "行业风险标注数据集", "succeeded", 100, 98_350, "v1.2.0"),
-        ("tsk_process_demo_04", "跨文化语料文本清洗", "跨文化交流语料", "succeeded", 100, 156_900, "v1.1.0"),
-        ("tsk_process_demo_05", "政务问答数据质量处理", "政务服务问答数据集", "succeeded", 100, 72_640, "v1.1.0"),
         ("tsk_process_demo_06", "历史批次异常格式修复", "新闻资讯数据集", "failed", 100, 12_300, None),
         ("tsk_process_demo_07", "新增短视频样本清洗", "短视频风险样本集", "running", 64, 45_800, None),
     ]
