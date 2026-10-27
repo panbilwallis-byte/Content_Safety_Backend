@@ -19,6 +19,7 @@ from app.models.tables import (
     ComplianceErrorComment,
     ComplianceLineageEdge,
     Dataset,
+    DatasetVersion,
     Model,
     ModelCall,
     ModelVersion,
@@ -99,6 +100,17 @@ def _node(entity_type: str, entity_id: Any, version: str | None, label: str, *, 
     return {**ref, "id": node_id or f"{entity_type}:{entity_id}:{version or '-'}", "type": entity_type}
 
 
+def _version_labels(db: Session) -> dict[tuple[str, str], str]:
+    """把版本引用的两种写法（dsv 主键 / 版本名）统一映射到版本名。"""
+    labels: dict[tuple[str, str], str] = {}
+    for row in db.scalars(select(DatasetVersion)).all():
+        if not row.label:
+            continue
+        labels[(str(row.dataset_id), row.version_id)] = row.label
+        labels[(str(row.dataset_id), row.label)] = row.label
+    return labels
+
+
 def _graph(db: Session) -> tuple[list[dict], list[dict]]:
     nodes: dict[str, dict] = {}
     edges: list[dict] = []
@@ -122,17 +134,29 @@ def _graph(db: Session) -> tuple[list[dict], list[dict]]:
 
     datasets = {str(row.id): row for row in db.scalars(select(Dataset)).all()}
     models = {str(row.id): row for row in db.scalars(select(Model)).all()}
-    known_dataset_versions: set[tuple[str, str]] = set()
+    labels = _version_labels(db)
+    known_dataset_versions: set[tuple[str, str]] = set(labels)
+
+    def version_name(dataset_id: object, ref: object) -> str:
+        """把 dsv 主键或版本名统一成版本名；未登记的引用原样保留，由缺口校验暴露。"""
+        if ref in (None, ""):
+            return "unknown"
+        return labels.get((str(dataset_id), str(ref)), str(ref))
+
     for dataset in datasets.values():
-        node_id = add_node(_node("dataset", dataset.id, dataset.version, dataset.name))
-        known_dataset_versions.add((str(dataset.id), dataset.version))
+        version = version_name(dataset.id, dataset.version)
+        add_node(_node("dataset", dataset.id, version, dataset.name))
+        known_dataset_versions.add((str(dataset.id), version))
 
     process_tasks = db.scalars(select(Task).where(Task.capability_code == "data_process")).all()
     for task in process_tasks:
         data = task.input_data or {}
         result = task.result or {}
         dataset_id = str(data.get("dataset_id") or data.get("datasetId") or "unknown")
-        input_version = str(data.get("dataset_version_id") or data.get("datasetVersionId") or task.dataset_version or "unknown")
+        input_version = version_name(
+            dataset_id,
+            data.get("dataset_version_id") or data.get("datasetVersionId") or task.dataset_version,
+        )
         dataset = datasets.get(dataset_id)
         input_node_id = f"dataset:{dataset_id}:{input_version}"
         if input_node_id not in nodes:
@@ -143,6 +167,7 @@ def _graph(db: Session) -> tuple[list[dict], list[dict]]:
                  f"evidence-process-{task.task_id}", missing)
         output_version = result.get("output_version")
         if output_version:
+            output_version = version_name(dataset_id, output_version)
             output_node_id = add_node(_node("dataset", dataset_id, str(output_version), dataset.name if dataset else f"未登记数据集 {dataset_id}"))
             known_dataset_versions.add((dataset_id, str(output_version)))
             add_edge(f"edge-process-output-{task.task_id}", task_node_id, output_node_id, "输出版本登记",
@@ -151,12 +176,13 @@ def _graph(db: Session) -> tuple[list[dict], list[dict]]:
     training_tasks = db.scalars(select(TrainingTask)).all()
     for task in training_tasks:
         dataset_id = str(task.dataset_id)
-        input_node_id = f"dataset:{dataset_id}:{task.dataset_version}"
+        input_version = version_name(dataset_id, task.dataset_version)
+        input_node_id = f"dataset:{dataset_id}:{input_version}"
         dataset = datasets.get(dataset_id)
         if input_node_id not in nodes:
-            add_node(_node("dataset", dataset_id, task.dataset_version, dataset.name if dataset else f"未登记数据集 {dataset_id}"))
+            add_node(_node("dataset", dataset_id, input_version, dataset.name if dataset else f"未登记数据集 {dataset_id}"))
         task_node_id = add_node(_node("training_task", task.id, task.target_version, task.name, node_id=f"training_task:{task.id}"))
-        missing = None if (dataset_id, task.dataset_version) in known_dataset_versions else "训练绑定的数据版本未登记"
+        missing = None if (dataset_id, input_version) in known_dataset_versions else "训练绑定的数据版本未登记"
         add_edge(f"edge-training-input-{task.id}", input_node_id, task_node_id, "训练数据绑定",
                  f"evidence-training-{task.id}", missing, task.id)
 
@@ -367,8 +393,11 @@ def lineage(entity_type: str, entity_id: str, version_id: str | None = None,
             db: Session = Depends(get_db)):
     ensure_compliance_data(db)
     nodes, edges = _graph(db)
+    wanted = version_id
+    if version_id and entity_type == "dataset":
+        wanted = _version_labels(db).get((str(entity_id), str(version_id)), version_id)
     roots = [node for node in nodes if node["entity_type"] == entity_type and str(node["entity_id"]) == str(entity_id)
-             and (not version_id or node["version_id"] == version_id)]
+             and (not wanted or node["version_id"] == wanted)]
     if not roots:
         raise HTTPException(status_code=404, detail="未找到谱系起点")
     ids = {node["id"] for node in roots}

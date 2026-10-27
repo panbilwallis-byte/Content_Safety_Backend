@@ -2,7 +2,7 @@ import unittest
 from unittest.mock import patch
 
 from fastapi import Request
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -96,6 +96,25 @@ class ComplianceApiTest(unittest.TestCase):
         self.assertIn("dsv_000001", versions)
         self.assertIn("dsv_000002", versions)
         self.assertEqual({item["source_id"] for item in candidates}, {"1"})
+
+    def test_lineage_merges_dsv_and_label_into_one_node(self):
+        """同一版本的 dsv 主键与版本名合并成一个点，且不再误报"未在资源库登记"。"""
+        from app.services.dataset_version_service import register_version
+
+        dataset = self.db.scalar(select(Dataset))
+        version = register_version(self.db, dataset, "v1.0.0")
+        dataset.version = version.version_id
+        task = self.db.scalar(select(Task))
+        task.input_data = {**task.input_data, "dataset_version_id": version.version_id}
+        self.db.commit()
+        data = lineage("dataset", str(dataset.id), None, "both", self.db)["data"]
+        versions = sorted({node["version_id"] for node in data["nodes"] if node["entity_type"] == "dataset"})
+        self.assertEqual(versions, ["dsv_000002", "v1.0.0"])  # dsv_000002 未登记，原样保留
+        self.assertEqual({edge["verification_state"] for edge in data["edges"]}, {"verified"})
+        self.assertEqual(data["gaps"], [])
+        # 用 dsv 主键发起查询，也要落到同一个 v1.0.0 起点
+        by_dsv = lineage("dataset", str(dataset.id), version.version_id, "both", self.db)["data"]
+        self.assertIn(f"dataset:{dataset.id}:v1.0.0", {node["id"] for node in by_dsv["nodes"]})
 
     def test_lineage_expands_to_training_and_model(self):
         response = lineage("dataset", "1", "dsv_000001", "downstream", self.db)
