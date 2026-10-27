@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import re
 import sys
 from pathlib import Path
@@ -19,6 +20,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sqlalchemy import select
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.core.database import SessionLocal
 from app.models.tables import DatasetRecord, Task
@@ -35,7 +37,9 @@ def main() -> int:
         fixed_tasks = 0
         fixed_rows = 0
         for task in tasks:
-            result = dict(task.result or {})
+            # 深拷贝：浅拷贝会和 ORM 已加载对象共享同一嵌套结构，改完 equals 原值，
+            # SQLAlchemy 认为无变化便不发 UPDATE（本次修复踩过的坑）。
+            result = copy.deepcopy(task.result or {})
             comparisons = result.get("comparisons") or []
             changed = False
             for row in comparisons:
@@ -53,7 +57,8 @@ def main() -> int:
             if changed:
                 fixed_tasks += 1
                 if not args.dry_run:
-                    task.result = {**result, "comparisons": comparisons}
+                    task.result = result
+                    flag_modified(task, "result")
         if not args.dry_run:
             db.commit()
         print(f"{'[dry-run] ' if args.dry_run else ''}涉及任务 {fixed_tasks} 个，对比行 {fixed_rows} 条")
