@@ -14,6 +14,7 @@ from app.models.tables import (
     SystemRole,
     SystemUser,
     Task,
+    TrainingTask,
     EvaluationMetric,
     EvaluationMetricRevision,
     EvaluationTask,
@@ -498,7 +499,15 @@ def ensure_resource_display_values():
             dataset.metadata_json = metadata
 
         # 旧演示模型此前全部为 v1.0.0；按模型 ID 回填不同的稳定版本。
+        # 有真实训练产物的模型跳过：那里的 v1.0.0 是产物指针，改成随机号会让
+        # 模型管理页的"当前版本"指向一个从未登记过的版本。
+        produced = {str(row) for row in db.scalars(select(ModelVersion.model_id).where(
+            ModelVersion.task_id.isnot(None)))}
+        produced |= {str(row) for row in db.scalars(select(TrainingTask.model_id).where(
+            TrainingTask.status == "succeeded"))}
         for model in db.scalars(select(Model)).all():
+            if str(model.id) in produced:
+                continue
             if not model.version or model.version == "v1.0.0":
                 model.version = model_version_default(model.id, model.name)
 
