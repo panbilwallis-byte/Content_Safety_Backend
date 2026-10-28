@@ -1,7 +1,8 @@
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from app.core.database import SessionLocal
-from app.models.tables import Dataset, DatasetVersion
+from app.models.tables import Dataset, DatasetRecord, DatasetVersion
+from app.services.dataset_version_service import purge_dataset_ledger
 from app.services.resource_service import create_new_dataset
 
 from fastapi import APIRouter, HTTPException, Query
@@ -413,6 +414,10 @@ def delete_dataset_api(dataset_id: int):
     Task and training history is intentionally retained for auditability.  Any
     historical lineage that referenced the removed dataset will surface as a
     missing source instead of silently rewriting history.
+
+    级联清理（#13 口径）：版本清单（dataset_versions + dataset_version_items）、
+    指向该数据集的谱系边、样本记录（dataset_records）随数据集一并删除，
+    避免遗留指向不存在数据集的孤儿数据。
     """
     with SessionLocal() as db:
         dataset = db.get(Dataset, dataset_id)
@@ -423,6 +428,9 @@ def delete_dataset_api(dataset_id: int):
             "name": dataset.name,
             "version": dataset.version,
         }
+        # 先清版本清单与该数据集相关的谱系边，再清样本记录，最后删数据集本身。
+        purge_dataset_ledger(db, dataset_id)
+        db.execute(delete(DatasetRecord).where(DatasetRecord.dataset_id == dataset_id))
         db.delete(dataset)
         add_log(
             task_id=None,
