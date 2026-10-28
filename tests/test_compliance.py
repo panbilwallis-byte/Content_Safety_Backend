@@ -8,7 +8,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.core.database import Base
 from app.core.time import now_shanghai
-from app.models.tables import ComplianceErrorComment, Dataset, Model, Task
+from app.models.tables import ComplianceErrorComment, Dataset, Model, ModelVersion, Task, TrainingTask
 from app.routers.compliance import (
     AlertAction,
     ErrorCommentBody,
@@ -126,6 +126,23 @@ class ComplianceApiTest(unittest.TestCase):
         )
         node_ids = {node["id"] for node in data["nodes"]}
         self.assertTrue(all(edge["from_id"] in node_ids and edge["to_id"] in node_ids for edge in data["edges"]))
+
+    def test_lineage_connects_base_model_version_to_training_task(self):
+        """v0.0.0 这类只作训练起点、没被任何任务产出的模型版本也要接入谱系。"""
+        model = self.db.scalar(select(Model))
+        training = self.db.scalar(select(TrainingTask))
+        self.db.add(ModelVersion(model_id=model.id, version="v0.0.0", description="基线版本"))
+        training.base_version = "v0.0.0"
+        self.db.commit()
+
+        data = lineage("model", str(model.id), "v1.4.0", "both", self.db)["data"]
+        triples = {(edge["relation"], edge["from_id"], edge["to_id"], edge["verification_state"])
+                   for edge in data["edges"]}
+        self.assertIn(("训练基座版本", f"model:{model.id}:v0.0.0",
+                       f"training_task:{training.id}", "verified"), triples)
+        self.assertIn(("训练产物登记", f"training_task:{training.id}",
+                       f"model:{model.id}:v1.4.0", "verified"), triples)
+        self.assertIn(f"model:{model.id}:v0.0.0", {node["id"] for node in data["nodes"]})
 
     def test_issue_summary_aggregates_gaps_and_errors_in_one_read(self):
         response = issue_summary(self.db)

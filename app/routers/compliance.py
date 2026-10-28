@@ -173,6 +173,9 @@ def _graph(db: Session) -> tuple[list[dict], list[dict]]:
             add_edge(f"edge-process-output-{task.task_id}", task_node_id, output_node_id, "输出版本登记",
                      f"evidence-process-{task.task_id}")
 
+    versions = db.scalars(select(ModelVersion)).all()
+    registered_model_versions = {(str(version.model_id), version.version) for version in versions}
+
     training_tasks = db.scalars(select(TrainingTask)).all()
     for task in training_tasks:
         dataset_id = str(task.dataset_id)
@@ -185,8 +188,17 @@ def _graph(db: Session) -> tuple[list[dict], list[dict]]:
         missing = None if (dataset_id, input_version) in known_dataset_versions else "训练绑定的数据版本未登记"
         add_edge(f"edge-training-input-{task.id}", input_node_id, task_node_id, "训练数据绑定",
                  f"evidence-training-{task.id}", missing, task.id)
+        # 基座版本是训练表单登记的起点版本：v0.0.0 这类未产出过任何任务的版本靠这条线接进谱系。
+        model = models.get(str(task.model_id))
+        base_node_id = f"model:{task.model_id}:{task.base_version}"
+        if base_node_id not in nodes:
+            add_node(_node("model", task.model_id, task.base_version,
+                           model.name if model else f"未登记模型 {task.model_id}"))
+        base_registered = model is not None and model.version == task.base_version
+        missing_base = None if base_registered or (str(task.model_id), task.base_version) in registered_model_versions else "训练基座版本未在版本清单登记"
+        add_edge(f"edge-training-base-{task.id}", base_node_id, task_node_id, "训练基座版本",
+                 f"evidence-training-{task.id}", missing_base, task.id)
 
-    versions = db.scalars(select(ModelVersion)).all()
     for version in versions:
         model = models.get(str(version.model_id))
         model_node_id = add_node(_node("model", version.model_id, version.version,
