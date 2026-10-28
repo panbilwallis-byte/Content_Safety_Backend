@@ -238,6 +238,8 @@ def current_model_workbench():
                     # 训练弹窗按 purpose=training 筛选、评估页按 purpose=evaluation 筛选；
                     # 用途存在 metadata_json.purpose，缺省视为训练集。
                     "purpose": (dataset.metadata_json or {}).get("purpose", "training"),
+                    # 配套脚本标识：前端选数据集后按它过滤脚本下拉，不再靠名称关键词猜。
+                    "dataset_key": (dataset.metadata_json or {}).get("dataset_key", ""),
                     "versions": _dataset_versions_payload(dataset, dataset_version_map),
                 }
                 for dataset in datasets

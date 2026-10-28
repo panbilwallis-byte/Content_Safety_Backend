@@ -216,22 +216,38 @@ LLM_TRAINING_BASE_URL = os.getenv("LLM_TRAINING_BASE_URL", "http://127.0.0.1:800
 LLM_SETUP_SECRET = os.getenv("LLM_SETUP_SECRET", "")
 
 
-REAL_SCRIPTS = {
-    # 平台可代为建单的真实训练脚本：脚本 ID -> (中文名, 参数组装)。
-    # 参数上下界由模型服务侧的 Pydantic 再校验一遍，这里只负责按脚本口径组装载荷。
-    "mini-mlp": ("迷你 MLP（合成数据）", lambda request: {
-        "epochs": request.epochs, "learning_rate": request.learning_rate}),
-    "fashion-cnn": ("FashionMNIST 小型 CNN", lambda request: {
-        "epochs": request.epochs, "learning_rate": request.learning_rate,
-        "batch_size": request.batch_size,
-        **({"train_samples": request.train_samples} if request.train_samples else {})}),
-}
+# 前端表单里通用的超参字段；转发时按 8001 脚本目录里每个脚本的 parameters_schema.properties
+# 过滤——脚本 schema 里声明了哪个就转发哪个，没声明的不发，避免 extra="forbid" 校验失败。
+# 这样 8001 新增脚本后，8000 无需改代码即可代理建单。
+_FORWARDABLE_PARAMS = ("epochs", "learning_rate", "batch_size", "train_samples")
+
+
+def _fetch_script_catalog(headers: dict) -> list[dict]:
+    """从 8001 拉取脚本目录；失败时抛 502。"""
+    try:
+        resp = httpx.get(f"{LLM_TRAINING_BASE_URL}/scripts", headers=headers, timeout=10)
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail=f"模型服务脚本目录不可达：{exc}") from exc
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"模型服务脚本目录查询失败：{resp.text[:200]}")
+    return resp.json().get("data") or []
+
+
+def _build_script_parameters(request: CreateRealTrainingRequest, script_entry: dict) -> dict:
+    """按脚本 parameters_schema.properties 过滤前端通用超参，只转发脚本声明接受的字段。"""
+    props = ((script_entry.get("parameters_schema") or {}).get("properties") or {})
+    out: dict = {}
+    for field in _FORWARDABLE_PARAMS:
+        value = getattr(request, field, None)
+        if value is not None and field in props:
+            out[field] = value
+    return out
 
 
 @router.post("/training-tasks/real")
 def create_real_training_task(request: CreateRealTrainingRequest,
                               authorization: str = Header(default="")):
-    """代理模型服务建迷你脚本任务，成功后登记同款台账。
+    """代理模型服务建脚本任务，成功后登记同款台账。
 
     建单优先使用本服务配置的模型服务令牌（环境变量 LLM_ACCESS_TOKEN），未配置时
     退回透传浏览器头；平台登录令牌只用于 8000 网关，不再送往模型服务。
@@ -252,16 +268,21 @@ def create_real_training_task(request: CreateRealTrainingRequest,
         dataset = db.get(Dataset, dataset_id)
         if dataset is None:
             raise HTTPException(status_code=404, detail="训练数据集不存在")
-        if request.script_id not in REAL_SCRIPTS:
+        # 脚本目录以 8001 为准：8001 注册什么脚本就允许什么，不再在 8000 维护硬编码白名单。
+        catalog = _fetch_script_catalog(read_headers)
+        script_entry = next((s for s in catalog if s.get("id") == request.script_id), None)
+        if script_entry is None:
+            available = "、".join(s.get("id", "?") for s in catalog) or "（目录为空）"
             raise HTTPException(
                 status_code=422,
-                detail="暂不支持的真实训练脚本：" + request.script_id
-                       + "；可选 " + "、".join(REAL_SCRIPTS))
-        script_label, script_parameters = REAL_SCRIPTS[request.script_id]
+                detail="模型服务未登记脚本：" + request.script_id + "；可选 " + available)
+        script_label = script_entry.get("name") or request.script_id
+        script_parameters = _build_script_parameters(request, script_entry)
         upstream = httpx.post(
             f"{LLM_TRAINING_BASE_URL}/script-tasks",
             json={"name": request.name.strip(), "script_id": request.script_id,
-                  "parameters": script_parameters(request)},
+                  "data_version": request.dataset_version,
+                  "parameters": script_parameters},
             headers={"Authorization": read_headers["Authorization"], "X-Setup-Secret": LLM_SETUP_SECRET},
             timeout=30,
         )
@@ -322,6 +343,16 @@ def _llm_read(url: str, params: dict, authorization: str):
             message = upstream.text[:200]
         raise HTTPException(status_code=upstream.status_code, detail=f"模型服务：{message}")
     return success(data=upstream.json()["data"])
+
+
+@router.get("/training-tasks/scripts")
+def proxy_training_scripts(authorization: str = Header(default="")):
+    """台账只读代理：模型服务登记的真实训练脚本目录。
+
+    前端不再硬编码脚本白名单，8001 注册什么脚本（mini-mlp / fashion-cnn /
+    cifar100-cnn …）这里就透传什么；新增脚本无需改前端。
+    """
+    return _llm_read(f"{LLM_TRAINING_BASE_URL}/scripts", {}, authorization)
 
 
 @router.get("/training-tasks/{task_id}/detail")

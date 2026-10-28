@@ -183,10 +183,11 @@ class CreateRealTrainingRequest(BaseModel):
 class SyncTrainingTaskRequest(BaseModel):
     """真实训练任务的进度同步请求：曲线、检查点与终态由模型服务的真实指标聚合而来。"""
 
-    status: str = Field(pattern="^(running|succeeded|failed|canceled)$")
+    status: str = Field(pattern="^(pending|running|succeeded|failed|canceled)$")
     epoch: int = Field(ge=0)
     progress: float = Field(ge=0, le=100)
-    loss_history: list[float] = Field(default_factory=list)
-    validation_loss_history: list[float] = Field(default_factory=list)
+    # 训练中"本轮验证事件未落地"时曲线用 null 占位（前端断点展示），不顶替成训练损失
+    loss_history: list[float | None] = Field(default_factory=list)
+    validation_loss_history: list[float | None] = Field(default_factory=list)
     checkpoints: list[dict] = Field(default_factory=list)
     error_message: str | None = Field(default=None, max_length=2000)
