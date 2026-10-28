@@ -110,7 +110,13 @@ def ensure_trained_model_versions() -> None:
 
 
 def advance_training_task(db: Session, task: TrainingTask, now: datetime) -> bool:
-    """按真实经过时间缓慢推进演示训练；每次推进均写回数据库。"""
+    """按真实经过时间缓慢推进演示训练；每次推进均写回数据库。
+
+    真实训练任务（模型服务 UUID，长度 >= 20）由前端从 8001 同步真实进度，
+    这里只推进 TR- 短 ID 的演示任务，避免真实任务的台账被伪造曲线覆盖。
+    """
+    if len(task.id) >= 20:
+        return False
     if task.status != "running":
         return False
     elapsed_seconds = max(0, int((now - task.created_at).total_seconds()))
