@@ -87,9 +87,13 @@ def create_ingest_version(db: Session, dataset: Dataset, task_id: str | None = N
                           note: str | None = None) -> DatasetVersion:
     """为本次成功接入创建不可变的完整原始快照版本。
 
-    以前接入会改写同一个原始版本的清单；现在保留旧清单，另建一个包含全部
-    原始记录的新版本。版本只引用 dataset_records 中的行，不复制正文；编号
-    取最近原始版本末尾数字 +1，清洗产生的派生版本不参与编号。
+    改之前：每次接入都重写同一个原始版本的样本数、清单哈希和记录引用；旧版本
+    会跟着新增数据变化，无法还原它在接入前的内容。
+    改之后：保留已有版本不动，另建一个新原始版本；新版本的清单包含该数据集
+    所有原始记录，所以 10 条旧记录加 1 条新记录会形成 11 条样本的完整快照。
+    dataset_records 中的正文只保存一份，新版本通过 dataset_version_items 引用
+    这些记录 ID 和内容指纹，不会复制正文。新版本号取最近原始版本末尾数字 +1；
+    清洗任务产生的派生版本不参与这个编号。用户填写的说明保存在版本说明字段。
     """
     rows = db.execute(select(DatasetRecord.id, DatasetRecord.content_hash)
                       .where(DatasetRecord.dataset_id == dataset.id,

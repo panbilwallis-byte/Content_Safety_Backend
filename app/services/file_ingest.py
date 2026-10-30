@@ -1,4 +1,10 @@
-"""解析本地文件为 DatasetRecord payload；CSV 每个数据行对应一条记录。"""
+"""本地文件接入记录的解析规则。
+
+改之前：TXT、CSV、JSON 都把整份文件当成一条 dataset_records 记录，CSV 的多行
+数据挤在同一个 payload.content 里，平台无法按表格行统计或逐条使用。
+改之后：CSV 第一行作为列名，每个非空数据行单独生成一条记录，列名和值放在
+该行 payload 中；TXT、JSON、XLSX、PDF 仍按整份文件各生成一条记录。
+"""
 from __future__ import annotations
 
 import csv
@@ -39,10 +45,14 @@ def _validate_json(content: str, path: Path) -> None:
 
 
 def read_uploaded_file_rows(file_ids: object) -> tuple[list[dict[str, Any]], int]:
-    """Return DB-ready records; CSV becomes one record per non-empty data row.
+    """解析已上传文件并返回待写入数据库的记录和文件总字节数。
 
-    XLSX/PDF are stored as a document record until a dedicated document parser
-    is configured; their binary is never placed in an in-memory task result.
+    CSV 会忽略表头及全空行；遇到带引号的单元格内换行时，仍把整条表格记录
+    当成一条样本。每条 CSV 样本的原始列值保留在 payload 顶层，文件名、行号
+    和内容指纹放在 payload._source 中，避免与用户列名混在一起。
+
+    TXT、JSON、XLSX、PDF 当前仍按文件保存为一条记录；XLSX/PDF 暂存整份文档，
+    后续接入专用解析器后再拆分文档内部内容。
     """
     if not isinstance(file_ids, list) or not file_ids:
         raise ValueError("本地文件接入至少需要一个已上传文件")
@@ -69,8 +79,9 @@ def read_uploaded_file_rows(file_ids: object) -> tuple[list[dict[str, Any]], int
             except UnicodeDecodeError as error:
                 raise ValueError(f"文件必须使用 UTF-8 编码：{path.name}") from error
             if extension == ".csv":
-                # 以前把整份 CSV 当成一条记录保存；现在跳过表头和空行，
-                # 每个数据行单独保存，列名和值原样放进该行的 payload。
+                # 改之前：只检查 CSV 有没有表头，随后把整个文件文本塞进一条记录。
+                # 改之后：按 CSV 规则解析表格；一条非空数据行对应一条 payload，
+                # 表头成为字段名，行号和指纹单独放进 _source，方便追溯原文件。
                 reader = csv.DictReader(io.StringIO(content), strict=True)
                 fieldnames = reader.fieldnames
                 if not fieldnames or any(not (name or "").strip() for name in fieldnames):

@@ -463,8 +463,10 @@ def run_mock_task(
                         ),
                     )
                     result["duplicate_count"] = duplicate_count
-                # 原件行全部落库后才冻结原始清单快照，样本数与清单哈希才与本次接入一致 (#13)；
-                # 随后把"任务→数据集/清单"写进谱系边台账 (#13-1.6)。
+                # 改之前：每次接入都会重写原始版本的清单，旧版本也会包含新数据。
+                # 改之后：等新记录全部落库，再创建一个包含全部原件行的新快照，旧版本不变；
+                # CSV 的每个数据行在上一步已拆成单独记录，这里会逐条纳入新版本清单。
+                # 同时保存用户填写的接入说明，并登记“任务→数据集/版本”的来源关系。
                 create_ingest_version(
                     db, dataset, task_id=task_id,
                     note=input_data.get("ingestNote") or input_data.get("ingest_note"))
