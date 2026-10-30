@@ -100,11 +100,16 @@ class CreateRealTaskTokenTest(unittest.TestCase):
             dataset_version="v1.0.0", target_version="4.1.4", epochs=2,
             learning_rate=0.05, batch_size=8, method="低秩适配微调")
 
+    def _script_catalog(self):
+        return [{"id": "mini-mlp", "name": "小型 MLP",
+                 "parameters_schema": {"properties": {"epochs": {}, "learning_rate": {}}}}]
+
     def test_create_uses_server_token_not_platform_header(self):
         module.LLM_ACCESS_TOKEN = "svc-token"
         fake = FakeResponse(status_code=202,
                             payload={"code": 0, "data": {"id": "11111111-1111-1111-1111-111111111111"}})
-        with patch.object(module.httpx, "post", return_value=fake) as post:
+        with patch.object(module, "_fetch_script_catalog", return_value=self._script_catalog()), \
+                patch.object(module.httpx, "post", return_value=fake) as post:
             result = module.create_real_training_task(self._request(), authorization="Bearer platform-token")
         sent = post.call_args.kwargs["headers"]
         self.assertEqual(sent["Authorization"], "Bearer svc-token")
@@ -116,7 +121,8 @@ class CreateRealTaskTokenTest(unittest.TestCase):
     def test_upstream_401_maps_to_502(self):
         module.LLM_ACCESS_TOKEN = "svc-token"
         fake = FakeResponse(status_code=401, payload={"message": "Missing, invalid, disabled, or expired token"})
-        with patch.object(module.httpx, "post", return_value=fake):
+        with patch.object(module, "_fetch_script_catalog", return_value=self._script_catalog()), \
+                patch.object(module.httpx, "post", return_value=fake):
             with self.assertRaises(HTTPException) as ctx:
                 module.create_real_training_task(self._request(), authorization="")
         self.assertEqual(ctx.exception.status_code, 502)

@@ -161,7 +161,7 @@ def ensure_dataset_versions_backfill() -> None:
             exists = db.scalar(select(DatasetVersion)
                                .where(DatasetVersion.dataset_id == dataset.id).limit(1))
             if exists is None:
-                # 与 refresh_raw_version 同口径：启动补登只收原件行，清洗派生行不进原始快照 (#13)。
+                # 首次建清单只收原件行，清洗派生行不混入原始版本；日常接入则另建完整快照。
                 raw_ids = list(db.scalars(select(DatasetRecord.id)
                                .where(DatasetRecord.dataset_id == dataset.id,
                                       DatasetRecord.source_record_id.is_(None))

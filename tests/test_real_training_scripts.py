@@ -63,24 +63,36 @@ class RealTrainingScriptTest(unittest.TestCase):
     def _upstream(self):
         return FakeResponse(payload={"data": {"id": "0f4c1a9b-2d3e-4a5b-9c8d-7e6f5a4b3c2d"}})
 
+    def _catalog(self):
+        return FakeResponse(payload={"data": [
+            {"id": "mini-mlp", "name": "小型 MLP",
+             "parameters_schema": {"properties": {"epochs": {}, "learning_rate": {}}}},
+            {"id": "fashion-cnn", "name": "FashionMNIST CNN",
+             "parameters_schema": {"properties": {
+                 "epochs": {}, "learning_rate": {}, "batch_size": {}, "train_samples": {},
+             }}},
+        ]})
+
     def test_fashion_script_loads_its_own_parameters(self):
-        with patch.object(module.httpx, "post", return_value=self._upstream()) as post:
-            module.create_real_training_task(request("fashion-cnn", train_samples=5000),
-                                             authorization="")
+        with patch.object(module.httpx, "get", return_value=self._catalog()), \
+                patch.object(module.httpx, "post", return_value=self._upstream()) as post:
+            module.create_real_training_task(request("fashion-cnn", train_samples=5000), authorization="")
         body = post.call_args.kwargs["json"]
         self.assertEqual(body["script_id"], "fashion-cnn")
         self.assertEqual(body["parameters"], {"epochs": 3, "learning_rate": 0.001,
                                               "batch_size": 128, "train_samples": 5000})
 
     def test_mini_mlp_keeps_its_narrow_parameter_set(self):
-        with patch.object(module.httpx, "post", return_value=self._upstream()) as post:
+        with patch.object(module.httpx, "get", return_value=self._catalog()), \
+                patch.object(module.httpx, "post", return_value=self._upstream()) as post:
             module.create_real_training_task(request(), authorization="")
         body = post.call_args.kwargs["json"]
         self.assertEqual(body["script_id"], "mini-mlp")  # 缺省脚本不变，老前端不受影响
         self.assertEqual(body["parameters"], {"epochs": 3, "learning_rate": 0.001})
 
     def test_unlisted_script_is_rejected_without_calling_model_service(self):
-        with patch.object(module.httpx, "post", return_value=self._upstream()) as post:
+        with patch.object(module.httpx, "get", return_value=self._catalog()), \
+                patch.object(module.httpx, "post", return_value=self._upstream()) as post:
             with self.assertRaises(HTTPException) as caught:
                 module.create_real_training_task(request("cifar100-cnn"), authorization="")
         self.assertEqual(caught.exception.status_code, 422)
@@ -88,7 +100,8 @@ class RealTrainingScriptTest(unittest.TestCase):
         post.assert_not_called()
 
     def test_start_event_names_the_actual_script_and_dataset(self):
-        with patch.object(module.httpx, "post", return_value=self._upstream()):
+        with patch.object(module.httpx, "get", return_value=self._catalog()), \
+                patch.object(module.httpx, "post", return_value=self._upstream()):
             module.create_real_training_task(request("fashion-cnn"), authorization="")
         with self.Session() as db:
             event = db.scalar(select(ComplianceEvent).where(

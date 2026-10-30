@@ -14,9 +14,9 @@ from app.models.tables import (
     DatasetVersionItem,
 )
 from app.services.dataset_version_service import (
+    create_ingest_version,
     manifest_hash,
     purge_dataset_ledger,
-    refresh_raw_version,
     register_version,
     resolve_version,
 )
@@ -89,26 +89,30 @@ class DatasetVersionServiceTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             register_version(self.db, self.dataset, "v1.0.1", [1, 2, foreign.id])
 
-    def test_refresh_raw_version_tracks_new_raw_rows(self):
-        first = refresh_raw_version(self.db, self.dataset, "TR-ING-1")
+    def test_each_ingest_creates_full_new_raw_version_and_preserves_old_snapshot(self):
+        first = create_ingest_version(self.db, self.dataset, "TR-ING-1")
         self.db.commit()
         self.assertEqual(first.sample_count, 3)
         first_hash = first.manifest_hash
         self.db.add(DatasetRecord(dataset_id=self.dataset.id, task_id="TR-ING-2",
                                   content_hash="h4", payload={"text": "新样本"}))
         self.db.commit()
-        second = refresh_raw_version(self.db, self.dataset, "TR-ING-2")
+        second = create_ingest_version(self.db, self.dataset, "TR-ING-2")
         self.db.commit()
-        self.assertEqual(second.version_id, first.version_id)  # 同一原始版本滚动，不新建
+        self.assertNotEqual(second.version_id, first.version_id)
+        self.assertEqual(second.label, "v1.0.1")
         self.assertEqual(second.sample_count, 4)
-        self.assertNotEqual(second.manifest_hash, first_hash)
+        self.assertEqual(first.sample_count, 3)
+        self.assertEqual(first.manifest_hash, first_hash)
+        self.assertEqual(self._record_ids(first.version_id), [1, 2, 3])
+        self.assertEqual(self._record_ids(second.version_id), [1, 2, 3, 4])
 
-    def test_refresh_ignores_derived_rows(self):
+    def test_new_ingest_version_ignores_derived_rows(self):
         derived = DatasetRecord(dataset_id=self.dataset.id, task_id="TR-CLEAN",
                                 content_hash="hd", source_record_id=1, payload={"text": "派生"})
         self.db.add(derived)
         self.db.commit()
-        version = refresh_raw_version(self.db, self.dataset, "TR-ING-1")
+        version = create_ingest_version(self.db, self.dataset, "TR-ING-1")
         self.db.commit()
         self.assertEqual(version.sample_count, 3)  # 派生行不进原始快照
 
@@ -124,7 +128,7 @@ class DatasetVersionServiceTest(unittest.TestCase):
         self.assertEqual(newest.version_id, "dsv_000004")
 
     def test_purge_dataset_ledger_leaves_no_orphan_manifest_or_edge(self):
-        refresh_raw_version(self.db, self.dataset, "TR-ING-1")
+        create_ingest_version(self.db, self.dataset, "TR-ING-1")
         record_ingest_edge(self.db, task_id="TR-ING-1", dataset=self.dataset)
         self.db.commit()
         purge_dataset_ledger(self.db, self.dataset.id)

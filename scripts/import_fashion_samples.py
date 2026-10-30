@@ -33,7 +33,7 @@ from sqlalchemy import delete, select
 from app.core.database import SessionLocal
 from app.core.time import now_shanghai
 from app.models.tables import Dataset, DatasetRecord, Task
-from app.services.dataset_version_service import purge_dataset_ledger, refresh_raw_version
+from app.services.dataset_version_service import create_ingest_version, purge_dataset_ledger
 from app.services.lineage_service import record_ingest_edge
 
 DATASET_NAME = "FashionMNIST 图像样本集"
@@ -208,7 +208,8 @@ def main() -> int:
             dataset_version=DATASET_VERSION,
             created_at=now_shanghai(), finished_at=now_shanghai()))
         db.flush()
-        refresh_raw_version(db, dataset, task_id=task_id)
+        # 改之前：导入脚本把新样本并入原始版本；改之后：登记完整新版本，旧版本保持原样。
+        create_ingest_version(db, dataset, task_id=task_id)
         record_ingest_edge(db, task_id=task_id, dataset=dataset)
         db.commit()
         print(f"导入完成：数据集 id={dataset.id}，样本 {imported} 条，重复跳过 {duplicates} 条，"

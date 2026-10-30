@@ -26,7 +26,7 @@ from sqlalchemy import delete, select
 from app.core.database import SessionLocal
 from app.core.time import now_shanghai
 from app.models.tables import Dataset, DatasetRecord, Task
-from app.services.dataset_version_service import purge_dataset_ledger, refresh_raw_version
+from app.services.dataset_version_service import create_ingest_version, purge_dataset_ledger
 from app.services.lineage_service import record_ingest_edge
 
 DATASET_NAME = "大模型安全反例库"
@@ -147,9 +147,10 @@ def main() -> int:
                                "source": "MajorDataGovernanceProject/01_最终反例库"},
             dataset_version=DATASET_VERSION,
             created_at=now_shanghai(), finished_at=now_shanghai()))
-        # 批量导入同样是真实接入：冻结原始清单快照并登记谱系边，否则这批数据在版本台账里是黑户 (#13)。
+        # 改之前：批量导入会刷新同一个原始版本的清单。
+        # 改之后：为这批记录新建完整原始版本，保留旧版本，并登记任务到版本的谱系关系。
         db.flush()
-        refresh_raw_version(db, dataset, task_id=task_id)
+        create_ingest_version(db, dataset, task_id=task_id)
         record_ingest_edge(db, task_id=task_id, dataset=dataset)
         db.commit()
         print(f"导入完成：数据集 id={dataset.id}，样本 {imported} 条，"

@@ -19,7 +19,7 @@ from app.models.tables import (
     TrainingTask,
 )
 from app.routers.training_tasks import register_trained_version
-from app.services.dataset_version_service import refresh_raw_version
+from app.services.dataset_version_service import create_ingest_version
 from app.services.lineage_service import (
     RELATION_DERIVED_FROM,
     RELATION_INGEST,
@@ -66,7 +66,7 @@ class LineageEdgeTest(unittest.TestCase):
                                       content_hash=text,
                                       payload={"text": text, "language": "zh", "topic_label": "综合"}))
         self.db.flush()
-        self.raw_version = refresh_raw_version(self.db, self.dataset, "TR-ING-1")
+        self.raw_version = create_ingest_version(self.db, self.dataset, "TR-ING-1")
         self.db.add(Task(task_id="TR-ING-1", name="接入任务", capability_code="data_ingest",
                          status="succeeded", input_data={"dataset_id": self.dataset.id},
                          result={"dataset_id": self.dataset.id}, config={}))

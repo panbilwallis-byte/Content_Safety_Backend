@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-"""为现有每个数据集模拟补登 10 条样本记录，并刷新原始版本快照（#13 口径）。
+"""为现有每个数据集模拟补登 10 条样本记录，并登记新的完整原始版本（#13 口径）。
 
 - dataset_records：每个数据集写入 10 条 source_record_id=NULL 的原件行，
   content_hash 与接入服务同口径（canonical JSON sha256），task_id 用
   tsk_sim_seed_<dataset_id:02d> 标记模拟批次。
-- dataset_versions / dataset_version_items：调用 refresh_raw_version 冻结
-  原始清单快照，保证 sample_count、manifest_hash、items 与 records 一致。
+- dataset_versions / dataset_version_items：调用 create_ingest_version 创建新快照，
+  保留旧版本，并保证新版本的 sample_count、manifest_hash、items 与原件记录一致。
 
 幂等：某数据集已存在 tsk_sim_seed_ 开头的记录时跳过，重复运行不会翻倍。
 """
@@ -21,7 +21,7 @@ sys.path.insert(0, r"D:\数据治理\Content_Safety_Backend")
 from app.core.database import SessionLocal
 from app.models.tables import Dataset, DatasetRecord, DatasetVersion, DatasetVersionItem
 from app.services.database_ingest import record_hash
-from app.services.dataset_version_service import refresh_raw_version
+from app.services.dataset_version_service import create_ingest_version
 
 SIM_TASK_PREFIX = "tsk_sim_seed_"
 PER_DATASET = 10
@@ -140,7 +140,8 @@ def main() -> int:
                 for row, content_hash in zip(rows, hashes)
             ])
             db.flush()
-            version = refresh_raw_version(db, dataset, task_id=task_id)
+            # 改之前：补登样本会改写现有原始版本；改之后：创建含旧样本和新样本的新版本。
+            version = create_ingest_version(db, dataset, task_id=task_id)
             print(
                 f"[ok] dataset_id={dataset_id} {dataset.name}: 写入 {len(rows)} 条记录, "
                 f"task_id={task_id}, 版本 {version.version_id} sample_count={version.sample_count}"
