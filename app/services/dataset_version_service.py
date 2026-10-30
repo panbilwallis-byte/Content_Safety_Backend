@@ -6,6 +6,7 @@ v1.0.0（标签），根治此前"dsv id 对上版本字符串"导致治理任�
 from __future__ import annotations
 
 import hashlib
+import re
 
 from sqlalchemy import delete, or_, select
 from sqlalchemy.orm import Session
@@ -82,33 +83,50 @@ def resolve_version(db: Session, dataset_id: int, version_ref: str) -> DatasetVe
         (DatasetVersion.version_id == version_ref) | (DatasetVersion.label == version_ref)))
 
 
-def refresh_raw_version(db: Session, dataset: Dataset, task_id: str | None = None) -> DatasetVersion:
-    """滚动更新原始接入快照（#13）：items=全部 source_record_id 为空的原件行。
+def create_ingest_version(db: Session, dataset: Dataset, task_id: str | None = None,
+                          note: str | None = None) -> DatasetVersion:
+    """为本次成功接入创建不可变的完整原始快照版本。
 
-    原始版本允许增长（每次接入成功追加行），但清单哈希随之变化——
-    分析结果在建单时记录当时的哈希，事后漂移可在结果页发现；
-    派生版本（清洗产出）一经登记永不滚动。
+    以前接入会改写同一个原始版本的清单；现在保留旧清单，另建一个包含全部
+    原始记录的新版本。版本只引用 dataset_records 中的行，不复制正文；编号
+    取最近原始版本末尾数字 +1，清洗产生的派生版本不参与编号。
     """
     rows = db.execute(select(DatasetRecord.id, DatasetRecord.content_hash)
                       .where(DatasetRecord.dataset_id == dataset.id,
                              DatasetRecord.source_record_id.is_(None))
                       .order_by(DatasetRecord.id)).all()
-    label = dataset.version or "v1.0.0"
-    version = db.scalar(select(DatasetVersion).where(
+    raw_versions = db.scalars(select(DatasetVersion).where(
         DatasetVersion.dataset_id == dataset.id,
-        DatasetVersion.label == label,
-        DatasetVersion.source_version_id.is_(None)))
-    if version is None:
-        return register_version(db, dataset, label, [row.id for row in rows],
-                                producing_task_id=task_id, change_summary="原始接入快照")
-    db.execute(delete(DatasetVersionItem).where(DatasetVersionItem.version_id == version.version_id))
-    db.add_all([DatasetVersionItem(version_id=version.version_id, record_id=row.id,
-                                   content_hash=row.content_hash) for row in rows])
-    version.sample_count = len(rows)
-    version.manifest_hash = manifest_hash((row.id, row.content_hash) for row in rows)
-    version.producing_task_id = task_id or version.producing_task_id
-    version.change_summary = "接入滚动更新：{}".format(task_id or "启动补登")
-    db.flush()
+        DatasetVersion.source_version_id.is_(None)
+    ).order_by(DatasetVersion.created_at.desc(), DatasetVersion.version_id.desc())).all()
+    if raw_versions:
+        previous_label = raw_versions[0].label
+    else:
+        # 新建数据集尚无快照时，以数据集初始版本作为首个原始版本。
+        previous_label = dataset.version or "v1.0.0"
+
+    match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", previous_label)
+    if match:
+        major, minor, patch = map(int, match.groups())
+        label = "v{}.{}.{}".format(major, minor, patch + 1) if raw_versions else previous_label
+    else:
+        label = "v1.0.0"
+
+    # 不能与同数据集已有派生版本重号；若冲突，继续递增末尾数字。
+    used_labels = set(db.scalars(select(DatasetVersion.label).where(
+        DatasetVersion.dataset_id == dataset.id)).all())
+    while label in used_labels:
+        match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", label)
+        if not match:
+            raise ValueError("无法为数据集生成不冲突的版本号")
+        major, minor, patch = map(int, match.groups())
+        label = "v{}.{}.{}".format(major, minor, patch + 1)
+
+    summary = (note or "").strip() or ("接入任务 {}".format(task_id) if task_id else "原始接入快照")
+    version = register_version(
+        db, dataset, label, [row.id for row in rows],
+        producing_task_id=task_id, change_summary=summary[:500])
+    dataset.version = label
     return version
 
 

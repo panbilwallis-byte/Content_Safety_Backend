@@ -13,7 +13,7 @@ from app.domain.capabilities import is_supported
 from app.domain.schemas import ExecuteTaskRequest
 from app.repositories.audit_repository import add_log
 from app.services.compliance_event_service import add_event
-from app.services.dataset_version_service import refresh_raw_version
+from app.services.dataset_version_service import create_ingest_version
 from app.services.lineage_service import record_ingest_edge
 from app.repositories.evaluation_repository import save_evaluation
 from app.repositories.resource_repository import (
@@ -454,14 +454,20 @@ def run_mock_task(
                         task_id=task_id,
                         rows=database_rows if connector_type == "database" else uploaded_rows,
                         content_hashes=(
-                            [row["source_content_hash"] for row in uploaded_rows]
+                            [
+                                (row.get("_source") or {}).get("content_hash")
+                                or row["source_content_hash"]
+                                for row in uploaded_rows
+                            ]
                             if connector_type == "file" else None
                         ),
                     )
                     result["duplicate_count"] = duplicate_count
                 # 原件行全部落库后才冻结原始清单快照，样本数与清单哈希才与本次接入一致 (#13)；
                 # 随后把"任务→数据集/清单"写进谱系边台账 (#13-1.6)。
-                refresh_raw_version(db, dataset, task_id=task_id)
+                create_ingest_version(
+                    db, dataset, task_id=task_id,
+                    note=input_data.get("ingestNote") or input_data.get("ingest_note"))
                 record_ingest_edge(db, task_id=task_id, dataset=dataset)
                 result["dataset_id"] = dataset.id
                 result["dataset_name"] = dataset.name

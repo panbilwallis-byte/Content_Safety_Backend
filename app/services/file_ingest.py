@@ -1,4 +1,4 @@
-"""本地文件按整份文档入库，每个文件对应一条 DatasetRecord。"""
+"""解析本地文件为 DatasetRecord payload；CSV 每个数据行对应一条记录。"""
 from __future__ import annotations
 
 import csv
@@ -7,7 +7,6 @@ import io
 import json
 from pathlib import Path
 from typing import Any
-
 
 UPLOAD_DIR = Path(__file__).resolve().parents[2] / "storage" / "uploads"
 
@@ -40,7 +39,7 @@ def _validate_json(content: str, path: Path) -> None:
 
 
 def read_uploaded_file_rows(file_ids: object) -> tuple[list[dict[str, Any]], int]:
-    """Return one DB-ready record per file, preserving complete text content.
+    """Return DB-ready records; CSV becomes one record per non-empty data row.
 
     XLSX/PDF are stored as a document record until a dedicated document parser
     is configured; their binary is never placed in an in-memory task result.
@@ -70,11 +69,44 @@ def read_uploaded_file_rows(file_ids: object) -> tuple[list[dict[str, Any]], int
             except UnicodeDecodeError as error:
                 raise ValueError(f"文件必须使用 UTF-8 编码：{path.name}") from error
             if extension == ".csv":
-                if not csv.DictReader(io.StringIO(content)).fieldnames:
+                # 以前把整份 CSV 当成一条记录保存；现在跳过表头和空行，
+                # 每个数据行单独保存，列名和值原样放进该行的 payload。
+                reader = csv.DictReader(io.StringIO(content), strict=True)
+                fieldnames = reader.fieldnames
+                if not fieldnames or any(not (name or "").strip() for name in fieldnames):
                     raise ValueError(f"CSV 文件缺少表头：{path.name}")
+                if len(set(fieldnames)) != len(fieldnames):
+                    raise ValueError(f"CSV 文件包含重复列名：{path.name}")
+                if "_source" in fieldnames:
+                    raise ValueError(f"CSV 文件使用了系统保留列名 _source：{path.name}")
+
+                csv_rows = []
+                for row_number, source_row in enumerate(reader, start=2):
+                    if None in source_row:
+                        raise ValueError(f"CSV 第 {row_number} 行列数多于表头：{path.name}")
+                    row = {key: value for key, value in source_row.items()}
+                    if not any(value is not None and str(value).strip() for value in row.values()):
+                        continue
+                    canonical = json.dumps(
+                        row, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                    )
+                    row_hash = sha256(canonical.encode("utf-8")).hexdigest()
+                    csv_rows.append({
+                        **row,
+                        "_source": {
+                            "storage_granularity": "row",
+                            "source_file_id": file_id,
+                            "source_filename": path.name,
+                            "source_extension": extension,
+                            "source_row_number": row_number,
+                            "content_hash": row_hash,
+                        },
+                    })
+                rows.extend(csv_rows)
+                continue
             elif extension == ".json":
                 _validate_json(content, path)
-            # 保留原始文本与换行；CSV/JSON 同样以整个文件为单位保存。
+            # TXT/JSON 保留原始文本；一个文件仍作为一条文档记录。
             payload["content"] = content
         rows.append(payload)
     return rows, total_bytes

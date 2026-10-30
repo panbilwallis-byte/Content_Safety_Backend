@@ -4,13 +4,14 @@ from hashlib import sha256
 from pathlib import Path
 from unittest.mock import patch
 
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
 
 from app.core.database import Base
 from app.domain.schemas import ExecuteTaskRequest
-from app.models.tables import Dataset, DatasetRecord, Task
+from app.models.tables import Dataset, DatasetRecord, DatasetVersionItem, Task
 from app.services.database_ingest import save_dataset_rows
+from app.services.dataset_version_service import create_ingest_version, register_version
 from app.services.file_ingest import read_uploaded_file_rows
 from app.services.task_service import run_mock_task
 
@@ -34,10 +35,9 @@ class FileIngestTest(unittest.TestCase):
             db.commit()
         return dataset_id
 
-    def test_text_formats_store_one_record_with_complete_content(self):
+    def test_text_and_json_files_store_one_record_with_complete_content(self):
         documents = {
             ".txt": "第一段\r\n\r\n  第二段  \r\n第三段\n",
-            ".csv": 'id,content\r\n1,"hello\r\nworld"\r\n2,另一条记录\r\n',
             ".json": '[\r\n  {"content": "第一条"},\r\n  {"content": "第二条"}\r\n]\r\n',
         }
         for extension, content in documents.items():
@@ -58,6 +58,24 @@ class FileIngestTest(unittest.TestCase):
                 self.assertEqual(rows[0]["source_content_hash"], sha256(raw).hexdigest())
                 self.assertEqual(byte_count, len(raw))
 
+    def test_csv_produces_one_record_per_non_empty_data_row(self):
+        content = 'id,content\r\n1,"hello\r\nworld"\r\n2,另一条记录\r\n\r\n'
+        raw = content.encode("utf-8-sig")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            upload_dir = Path(temporary_directory)
+            (upload_dir / "file_rows.csv").write_bytes(raw)
+            with patch("app.services.file_ingest.UPLOAD_DIR", upload_dir):
+                rows, byte_count = read_uploaded_file_rows(["file_rows"])
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["id"], "1")
+        self.assertEqual(rows[0]["content"], "hello\r\nworld")
+        self.assertEqual(rows[1]["id"], "2")
+        self.assertEqual(rows[1]["content"], "另一条记录")
+        self.assertEqual(rows[0]["_source"]["source_row_number"], 2)
+        self.assertEqual(rows[1]["_source"]["source_row_number"], 3)
+        self.assertEqual(len(rows[0]["_source"]["content_hash"]), 64)
+        self.assertEqual(byte_count, len(raw))
+
     def test_multiple_files_produce_one_record_each(self):
         documents = {
             "file_first.txt": b"first line\n\nsecond line\n",
@@ -70,10 +88,57 @@ class FileIngestTest(unittest.TestCase):
                 (upload_dir / filename).write_bytes(raw)
             with patch("app.services.file_ingest.UPLOAD_DIR", upload_dir):
                 rows, byte_count = read_uploaded_file_rows(["file_first", "file_second", "file_third"])
-        self.assertEqual(len(rows), 3)
-        self.assertEqual([row["source_filename"] for row in rows], list(documents))
-        self.assertEqual([row["content"] for row in rows], [raw.decode("utf-8") for raw in documents.values()])
+        self.assertEqual(len(rows), 4)
+        file_names = [row.get("source_filename") or row["_source"]["source_filename"] for row in rows]
+        self.assertEqual(file_names, ["file_first.txt", "file_second.csv", "file_second.csv", "file_third.json"])
+        self.assertEqual(rows[0]["content"], documents["file_first.txt"].decode("utf-8"))
+        self.assertEqual([row["content"] for row in rows[1:3]], ["hello", "world"])
+        self.assertEqual(rows[3]["content"], documents["file_third.json"].decode("utf-8"))
         self.assertEqual(byte_count, sum(len(raw) for raw in documents.values()))
+
+    def test_csv_rows_persist_as_records_and_new_version_references_full_snapshot(self):
+        dataset_id = self.create_dataset()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            upload_dir = Path(temporary_directory)
+            content = "id,content\n" + "".join(f"{i},样本{i}\n" for i in range(20))
+            (upload_dir / "file_twenty.csv").write_text(content, encoding="utf-8")
+            with patch("app.services.file_ingest.UPLOAD_DIR", upload_dir):
+                new_rows, _ = read_uploaded_file_rows(["file_twenty"])
+
+        with self.session_factory() as db:
+            dataset = db.get(Dataset, dataset_id)
+            old_rows = [{"id": i, "content": f"旧样本{i}"} for i in range(10)]
+            save_dataset_rows(db, dataset_id=dataset_id, task_id="tsk_initial", rows=old_rows)
+            old_ids = list(db.scalars(select(DatasetRecord.id).where(
+                DatasetRecord.dataset_id == dataset_id).order_by(DatasetRecord.id)).all())
+            original = register_version(db, dataset, "v1.0.0", old_ids,
+                                        change_summary="原始接入快照")
+            original_id = original.version_id
+            duplicate_count = save_dataset_rows(
+                db, dataset_id=dataset_id, task_id="tsk_csv",
+                rows=new_rows,
+                content_hashes=[row["_source"]["content_hash"] for row in new_rows],
+            )
+            self.assertEqual(duplicate_count, 0)
+            version = create_ingest_version(db, dataset, task_id="tsk_csv", note="新增 20 条 CSV 样本")
+            self.assertEqual(version.label, "v1.0.1")
+            self.assertEqual(version.sample_count, 30)
+            self.assertEqual(version.change_summary, "新增 20 条 CSV 样本")
+            old_item_count = db.scalar(select(func.count(DatasetVersionItem.id)).where(
+                DatasetVersionItem.version_id == original_id))
+            old_items = list(db.scalars(select(DatasetVersionItem.record_id).where(
+                DatasetVersionItem.version_id == original_id)).all())
+            new_items = list(db.scalars(select(DatasetVersionItem.record_id).where(
+                DatasetVersionItem.version_id == version.version_id)).all())
+            total_records = db.scalar(select(func.count(DatasetRecord.id)).where(
+                DatasetRecord.dataset_id == dataset_id))
+            self.assertEqual(old_item_count, 10)
+            self.assertEqual(len(old_items), 10)
+            self.assertEqual(len(new_items), 30)
+            self.assertEqual(len(set(new_items)), 30)
+            self.assertEqual(total_records, 30)
+            self.assertEqual(dataset.version, "v1.0.1")
+            db.commit()
 
     def test_complete_file_content_is_persisted_and_readable_in_a_new_session(self):
         content = "第一段\r\n\r\n第二段\r\n第三段\n"
