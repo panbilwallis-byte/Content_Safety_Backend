@@ -93,6 +93,10 @@ async def lifespan(app: FastAPI):
     seed_initial_data()
     ensure_evaluation_metric_columns()
     ensure_evaluation_metrics()
+    from app.services.risk_evaluation_service import ensure_metrics as ensure_governance_metrics
+    with SessionLocal() as db:
+        ensure_governance_metrics(db)
+        db.commit()
     ensure_evaluation_tasks()
     normalize_evaluation_display_values()
     # 初始模型写入后再执行一次来源/版本迁移，确保首启即得到数据库分布。

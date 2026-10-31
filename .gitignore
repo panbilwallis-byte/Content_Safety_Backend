@@ -16,3 +16,6 @@ logs/
 
 # 运行期上传与鉴权密钥，不进 git
 storage/
+
+# 本机数据库备份，不随源码发布
+/db/backups/
