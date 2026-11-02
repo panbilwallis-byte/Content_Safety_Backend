@@ -90,8 +90,21 @@ def create(database):
 
 def test_real_calculation_and_all_samples_and_stable_evidence(database):
     task = create(database)
+    with database() as db:
+        historical = db.get(EvaluationRun, task["runId"])
+        frozen = json.loads(json.dumps(historical.snapshot))
+        frozen["resolvedRefs"][0].pop("datasetName", None)
+        historical.snapshot = frozen
+        db.commit()
     api.start(task["taskId"])
+    frozen = api.run(task["runId"])["data"]["snapshot"]
+    # 老快照没有单独的数据集名称字段，仍从冻结的来源标题补全展示。
+    listed = api.task(task["taskId"])["data"]
+    assert listed["datasetDisplay"] == "测试数据集 v1.0.2"
+    assert listed["sourceRef"]["entityId"] == "risk-result"
     run = api.run(task["runId"])["data"]
+    assert run["datasetDisplay"] == "测试数据集 v1.0.2"
+    assert run["snapshot"] == frozen
     results = {r["metricCode"]: r for r in run["metricResults"]}
     assert results["risk_level_accuracy"]["numerator"] == 2
     assert results["risk_level_accuracy"]["denominator"] == 6

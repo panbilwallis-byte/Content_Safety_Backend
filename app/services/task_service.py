@@ -191,6 +191,9 @@ def run_mock_task(
    
    # 关联数据集
   
+    if request.capability_code == "evaluation" and (request.input.get("model_id") or request.input.get("modelId")):
+        raise ValueError("模型评估请使用 /model-workbenches/comparisons 真实对照接口")
+
     dataset_id = (
         request.input.get("dataset_id")
         or request.input.get("datasetId")
@@ -510,39 +513,6 @@ def run_mock_task(
                         ),
                     }
                 )
-
-                # 模型工作台评估页需要成组指标；以评估任务 ID 为种子做确定性生成：
-                # 同一任务刷新数字稳定（结果已落库），不同任务各不相同，
-                # 与训练曲线的 sha256 种子同一套路。
-                if request.input.get("model_id") or request.input.get("modelId"):
-                    model_id = str(request.input.get("model_id", request.input.get("modelId")))
-                    dataset_id = str(request.input.get("dataset_id", request.input.get("datasetId", "1")))
-                    rng = Random(int(sha256(task_id.encode("utf-8")).hexdigest(), 16))
-                    risk_total = rng.randint(96, 168)
-                    risk_before = round(risk_total * rng.uniform(0.22, 0.38))
-                    risk_after = max(1, round(risk_before * rng.uniform(0.08, 0.35)))
-                    target_total = rng.randint(48, 72)
-                    target_after = round(target_total * rng.uniform(0.88, 0.99))
-                    target_before = rng.randint(6, max(7, round(target_after * 0.35)))
-                    general_total = rng.randint(40, 60)
-                    general_after = round(general_total * rng.uniform(0.90, 0.99))
-                    general_before = max(1, general_after - rng.randint(2, 6))
-                    retention_total = rng.randint(64, 96)
-                    retention_before = retention_total
-                    retention_after = retention_total - rng.randint(0, 2)
-                    result["model_assessment"] = {
-                        "id": f"assessment-{task_id}", "task_id": task_id, "model_id": model_id,
-                        "baseline": request.config.get("baseline_version", request.config.get("baselineVersion", "")),
-                        "edited": request.config.get("edited_version", request.config.get("editedVersion", "")),
-                        "dataset_id": dataset_id,
-                        "dataset_version": request.config.get("dataset_version", request.config.get("datasetVersion", "")),
-                        "knowledge": "模型版本安全效果评估", "status": "succeeded",
-                        "risk_total": risk_total, "risk_before": risk_before, "risk_after": risk_after,
-                        "target_total": target_total, "target_before": target_before, "target_after": target_after,
-                        "general_total": general_total, "general_before": general_before, "general_after": general_after,
-                        "retention_total": retention_total, "retention_before": retention_before, "retention_after": retention_after,
-                        "samples": [{"type": "风险输出", "input": "模拟安全测试输入", "before": "存在风险线索", "after": "已完成安全约束"}],
-                    }
 
                 # 保存评估记录
                 save_evaluation(

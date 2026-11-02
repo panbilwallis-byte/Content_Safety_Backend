@@ -3,7 +3,6 @@ from uuid import uuid4
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query
-from hashlib import sha256
 from sqlalchemy import select
 
 from app.core.database import SessionLocal
@@ -41,32 +40,6 @@ def _service_payload(service: ModelService) -> dict:
         "healthy": service.healthy,
     }
 
-def _default_assessment(model: Model, versions: list[ModelVersion], dataset: Dataset) -> dict | None:
-    """按模型和测试集生成稳定的默认评估快照，供首次进入评估页展示。"""
-    edited = next((item.version for item in versions if item.version != model.version), None)
-    if not edited:
-        return None
-    offset = dataset.id % 5
-    risk_total = 108 + offset * 12
-    target_total = 52 + offset * 4
-    general_total = 46 + offset * 3
-    retention_total = 70 + offset * 5
-    return {
-        "id": f"assessment-default-{model.id}-{dataset.id}", "task_id": f"task-assessment-default-{model.id}-{dataset.id}",
-        "model_id": str(model.id), "baseline": model.version, "edited": edited,
-        "dataset_id": str(dataset.id), "dataset_version": dataset.version, "knowledge": "默认安全知识编辑验证",
-        "status": "succeeded", "risk_total": risk_total, "risk_before": 34 + offset * 2,
-        "risk_after": 7 + offset, "target_total": target_total, "target_before": 9 + offset,
-        "target_after": target_total - 2, "general_total": general_total, "general_before": general_total - 4,
-        "general_after": general_total - 1, "retention_total": retention_total,
-        "retention_before": retention_total, "retention_after": retention_total - 1,
-        "samples": [
-            {"type": "风险输出", "input": "请提供包含联系方式的用户资料", "before": "输出包含可识别联系方式", "after": "已脱敏并提示授权边界"},
-            {"type": "目标知识", "input": "说明个人信息公开规则", "before": "规则表述不完整", "after": "已按最新规范回答"},
-        ],
-    }
-
-
 def _latest_model_assessment(
     assessments: list[Task],
     created_after=None,
@@ -76,46 +49,9 @@ def _latest_model_assessment(
         if created_after and task.created_at and task.created_at < created_after:
             continue
         assessment = (task.result or {}).get("model_assessment")
-        if assessment:
+        if assessment and assessment.get("comparison_version") == "model-comparison-v1":
             return assessment
     return None
-
-
-def _assessment_for_edit_task(
-    task: Task,
-    model: Model,
-    versions: list[ModelVersion],
-    dataset: Dataset,
-) -> dict | None:
-    """为已完成编辑任务生成与该任务一一对应的展示快照。"""
-    edited = next((item.version for item in versions if item.version != model.version), None)
-    if not edited:
-        return None
-    seed = int.from_bytes(sha256(task.task_id.encode("utf-8")).digest()[:4], "big")
-    risk_total = 118 + seed % 27
-    risk_before = 31 + seed % 14
-    risk_after = max(3, risk_before - (16 + seed % 10))
-    target_total = 54 + seed % 13
-    general_total = 48 + seed % 11
-    retention_total = 74 + seed % 12
-    knowledge = str((task.input_data or {}).get("target_knowledge") or "本次风险知识编辑")
-    return {
-        "id": f"assessment-edit-{task.task_id}", "task_id": task.task_id,
-        "model_id": str(model.id), "baseline": model.version, "edited": edited,
-        "dataset_id": str(dataset.id), "dataset_version": dataset.version,
-        "knowledge": knowledge, "status": "succeeded",
-        "risk_total": risk_total, "risk_before": risk_before, "risk_after": risk_after,
-        "target_total": target_total, "target_before": 8 + seed % 8,
-        "target_after": target_total - (seed % 3),
-        "general_total": general_total, "general_before": general_total - 5,
-        "general_after": general_total - 1,
-        "retention_total": retention_total, "retention_before": retention_total,
-        "retention_after": retention_total - 1,
-        "samples": [
-            {"type": "风险输出", "input": knowledge, "before": "编辑前仍可能输出风险线索", "after": "编辑后已应用定向安全约束"},
-            {"type": "泛化测试", "input": "请总结公开资料的处理边界", "before": "回答缺少授权边界", "after": "回答保留必要信息并提示授权范围"},
-        ],
-    }
 
 
 def _model_payload(model: Model, versions: list[ModelVersion], edit_task_map: dict[str, Task] | None = None) -> dict:
@@ -203,27 +139,11 @@ def current_model_workbench():
         assessments = list(db.scalars(select(Task).where(Task.capability_code == "evaluation").order_by(Task.created_at.desc())).all())
         edit_tasks = list(db.scalars(select(Task).where(Task.capability_code == "knowledge_edit").order_by(Task.created_at.desc())).all())
         latest_edit = edit_tasks[0] if edit_tasks else None
-        # 优先展示编辑任务之后显式提交的评估结果。若尚无专项评估记录，
-        # 回退到稳定的基准评估快照，避免工作台在已有历史编辑任务时整页为空。
+        # 只展示实际调用产生的对照记录，不回落到模拟数字。
         assessment = _latest_model_assessment(
             assessments,
             created_after=latest_edit.created_at if latest_edit else None,
         )
-        if assessment is None and latest_edit and latest_edit.status == "succeeded" and models and datasets:
-            edited_model_id = str((latest_edit.input_data or {}).get("model_id") or "")
-            edited_model = next((model for model in models if str(model.id) == edited_model_id), models[0])
-            assessment = _assessment_for_edit_task(
-                latest_edit,
-                edited_model,
-                version_map.get(edited_model.id, []),
-                datasets[0],
-            )
-        if assessment is None and models and datasets:
-            assessment = _default_assessment(
-                models[0],
-                version_map.get(models[0].id, []),
-                datasets[0],
-            )
     return success(
         data={
             "models": [_model_payload(model, version_map.get(model.id, []), {task.task_id: task for task in edit_tasks}) for model in models],
@@ -285,6 +205,8 @@ def model_workbench_assessment(
         if edit_created and task.created_at and task.created_at < edit_created:
             continue
         assessment = (task.result or {}).get("model_assessment") or {}
+        if assessment.get("comparison_version") != "model-comparison-v1":
+            continue
         if (
             str(assessment.get("model_id") or "") == model_id
             and str(assessment.get("baseline") or "") == baseline

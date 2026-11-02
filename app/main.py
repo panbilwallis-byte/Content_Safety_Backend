@@ -49,6 +49,7 @@ from app.core.seed import (
 from app.repositories.evaluation_repository import ensure_demo_evaluations
 from app.routers.training_tasks import ensure_trained_model_versions
 from app.routers.model_workbench import sync_model_call_tasks
+from app.routers.model_comparison import router as model_comparison_router
 from app.services.compliance_service import seed_compliance_data
 from app.services.dataset_version_service import ensure_dataset_versions_backfill
 from app.services.lineage_service import ensure_lineage_edges_backfill
@@ -80,6 +81,9 @@ async def lifespan(app: FastAPI):
 
     # 根据 tables.py 中的模型创建表
     Base.metadata.create_all(bind=engine)
+    from app.services.model_comparison import recover as recover_comparisons
+    with SessionLocal() as db:
+        recover_comparisons(db)
 
     ensure_dataset_source_type_column()
     ensure_user_passwords()
@@ -306,6 +310,8 @@ app.include_router(
     tags=["训练中合规事件"],
 )
 
+
+app.include_router(model_comparison_router, prefix="/api/v1", tags=["模型真实对照评估"])
 
 @app.get("/health")
 def health():

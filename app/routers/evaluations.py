@@ -10,6 +10,7 @@ from app.core.response import success
 from app.core.time import now_shanghai
 from app.models.tables import Dataset, Model, EvaluationMetric, EvaluationMetricRevision, EvaluationTask, EvaluationRun, EvaluationEvent, EvaluationWorkspaceItem
 from app.services import risk_evaluation_service as risk_eval
+from app.services import model_comparison as comparison
 
 router = APIRouter()
 _preflights: dict[str, tuple[datetime, str]] = {}
@@ -27,8 +28,24 @@ def metric_dict(db, m):
     return {"metricId": m.metric_id, "code": m.code, "name": m.name, "category": m.category, "description": m.description,
             "status": m.status, "activeRevision": active, "latestRevision": latest,
             "configurationStatus": m.configuration_status, "issues": m.issues or []}
-def task_dict(t):
-    return {"taskId": t.task_id, "runId": t.run_id, "recordId": t.record_id, "name": t.name, "status": t.status,
+def display_context(snapshot):
+    """从冻结来源恢复历史展示信息，不修改归档快照及证据哈希。"""
+    import re
+    source = (snapshot.get("resolvedRefs") or [{}])[0]
+    version = snapshot.get("datasetVersion") or source.get("datasetVersion") or ""
+    name = snapshot.get("datasetName") or source.get("datasetName") or ""
+    if not name and source.get("capabilityCode") in risk_eval.KINDS:
+        title = re.sub(r"^【[^】]*】", "", source.get("name", "")).split("｜", 1)[0].strip()
+        source_version = source.get("datasetVersion") or version
+        if source_version and title.endswith(source_version):
+            name = title[:-len(source_version)].strip()
+    return {"datasetDisplay": f"{name} {version}".strip() if name else version or "未记录", "sourceRef": source or None}
+
+
+def task_dict(t, db=None):
+    run = db.get(EvaluationRun, t.run_id) if db is not None else None
+    display = display_context(run.snapshot or {}) if run else {"datasetDisplay": t.dataset_version, "sourceRef": None}
+    return {**display, "taskId": t.task_id, "runId": t.run_id, "recordId": t.record_id, "name": t.name, "status": t.status,
             "targetStage": t.target_stage, "datasetVersion": t.dataset_version, "modelVersion": t.model_version,
             "metricCount": t.metric_count, "judgmentStatus": t.judgment_status, "allowedActions": t.allowed_actions or [],
             "createdAt": iso(t.created_at), "startedAt": iso(t.started_at), "finishedAt": iso(t.finished_at),
@@ -42,7 +59,7 @@ def run_dict(r, db=None):
             EvaluationWorkspaceItem.payload["runId"].as_string() == r.run_id,
         )).all()
         exports = [{k: v for k, v in job.payload.items() if k != "content"} for job in jobs]
-    return {"runId": r.run_id, "taskId": r.task_id, "recordId": r.record_id, "testNo": r.test_no, "name": r.name,
+    return {**display_context(r.snapshot or {}), "runId": r.run_id, "taskId": r.task_id, "recordId": r.record_id, "testNo": r.test_no, "name": r.name,
             "attemptNo": r.attempt_no, "retryOf": r.retry_of, "taskStatus": r.task_status, "judgmentStatus": r.judgment_status,
             "algorithmMode": r.algorithm_mode, "startedAt": iso(r.started_at), "finishedAt": iso(r.finished_at),
             "createdAt": iso(r.created_at), "snapshot": r.snapshot or {}, "metricResults": r.metric_results or [],
@@ -65,6 +82,8 @@ def source_context(db):
             "capturedAt":iso(dataset.created_at), "interface":"数据库数据集快照"}
 
 def resolve_context(db, ref):
+    if config_value(ref, "entityType") == "model_comparison":
+        return comparison.resolve_source(db, ref)
     if config_value(ref, "entityType") == "task_result":
         return risk_eval.resolve_source(db, ref)
     source = source_context(db)
@@ -103,6 +122,14 @@ def preflight_issues(db, config: dict[str, Any]) -> list[dict[str, str]]:
         ref = source_refs[0]
         try:
             source = resolve_context(db, ref)
+            if source["entityType"] == "model_comparison":
+                if config_value(config, "executionMode") != "reference":
+                    raise HTTPException(400, "模型对照仅支持引用已有结果，重新推理请回模型评估页")
+                if config_value(config, "sampleScope", {"mode": "all"}) != {"mode": "all"}:
+                    raise HTTPException(400, "当前模型对照使用完整固定题集")
+                for field, key in (("datasetVersionRef", "datasetVersion"), ("labelVersionRef", "labelVersion"), ("modelVersionRef", "modelVersion")):
+                    if config_value(config, field) != source[key]:
+                        raise HTTPException(400, "对照来源的数据或模型版本不一致")
             if source["entityType"] == "task_result":
                 if config_value(config, "executionMode") != "reference":
                     raise HTTPException(400, "当前治理评估只支持引用已有结果；重新分析请回对应治理页面")
@@ -122,6 +149,12 @@ def preflight_issues(db, config: dict[str, Any]) -> list[dict[str, str]]:
         published = {revision.revision_id for revision in revisions if revision.configuration_status == "published"}
         if set(revision_refs) != published:
             issues.append({"field": "metricRevisionRefs", "reasonCode": "metric_unavailable", "message": "包含未发布或不存在的指标修订，请刷新后重新选择。"})
+        if source and source["entityType"] == "model_comparison":
+            for revision in revisions:
+                if (revision.metric_code not in comparison.CODES
+                        or db.get(EvaluationMetric, revision.metric_id).status != "enabled"
+                        or not any(t.get("stage") == config_value(config, "targetStage") for t in (revision.definition or {}).get("thresholds", []))):
+                    issues.append({"field": "metricRevisionRefs", "reasonCode": "metric_unavailable", "message": "所选指标或目标阶段不适用于模型对照"})
         if source_refs and config_value(source_refs[0], "entityType") == "task_result":
             for revision in revisions:
                 allowed = risk_eval.KINDS.get((source or {}).get("capabilityCode"), (None, None, None, None, ()))[4]
@@ -245,6 +278,16 @@ def bridge_model_assessment(db, task_row, assessment: dict[str, Any]) -> None:
         integrity_state="complete", config=config, created_at=task_row.created_at or now, started_at=now, finished_at=now)
     db.add_all([archived, run, EvaluationEvent(task_id=task_id, stage="archived",
         message="模型评估结果已从模型训推页导入测试评估归档。", status="succeeded")])
+    if assessment.get("comparison_version") == comparison.VERSION:
+        run.snapshot = {**snapshot, "modelComparison": assessment,
+                        "modelComparisonHash": comparison.digest(assessment),
+                        "sampleManifestHash": assessment["input_hash"], "sampleCount": len(assessment["samples"])}
+        comparison.apply_run(run)
+        run.task_status = task_row.status
+        archived.status = task_row.status
+        archived.judgment_status = run.judgment_status
+        archived.total_count = len(assessment["samples"])
+        archived.processed_count = len(assessment["samples"])
     db.flush()
 
 @router.get("/evaluation/session")
@@ -348,13 +391,13 @@ def tasks(keyword:str|None=None,status:str|None=None,stage:str|None=None,page:in
         # 状态卡的计数只跟随搜索词与阶段变化，不受"状态"本身筛选影响，否则点任一状态卡都会把另外两张清零。
         scoped=[t for t in all_rows if (not keyword or keyword.lower() in t.name.lower()) and (not stage or t.target_stage==stage)]
         rows=[t for t in scoped if not status or t.status==status]
-        total=len(rows); return success({"items":[task_dict(t) for t in rows[(page-1)*page_size:page*page_size]],"total":total,"page":page,"pageSize":page_size,"totalPages":(total+page_size-1)//page_size,"summary":[{"name":s,"value":sum(t.status==s for t in scoped)} for s in ["pending","running","failed"]]})
+        total=len(rows); return success({"items":[task_dict(t, db) for t in rows[(page-1)*page_size:page*page_size]],"total":total,"page":page,"pageSize":page_size,"totalPages":(total+page_size-1)//page_size,"summary":[{"name":s,"value":sum(t.status==s for t in scoped)} for s in ["pending","running","failed"]]})
 @router.get("/tasks/{task_id}")
 def task(task_id:str):
     with SessionLocal() as db:
         t=db.get(EvaluationTask,task_id)
         if not t: raise HTTPException(404,"测试任务不存在")
-        return success(task_dict(t))
+        return success(task_dict(t, db))
 @router.get("/evaluation/tasks/{task_id}/progress")
 def progress(task_id:str): return task(task_id)
 @router.get("/evaluation/tasks/{task_id}/events")
@@ -396,8 +439,13 @@ def create_task(body:CreateTask, request:Request):
                             sampleManifestHash=block["manifestHash"], sourceResultHashes=[block["sourceHash"]],
                             evaluatorVersion=block["version"], sampleCount=len(block["samples"]))
             t.total_count = len(block["samples"])
+        elif source["entityType"] == "model_comparison":
+            original = db.get(EvaluationRun, source["entityId"])
+            block = original.snapshot["modelComparison"]
+            snapshot.update(modelComparison=block, modelComparisonHash=comparison.digest(block),
+                            sampleManifestHash=block["input_hash"], sampleCount=len(block["samples"]))
         r=EvaluationRun(run_id=rid,task_id=tid,record_id=record,test_no=f"EVAL-{now:%Y%m%d%H%M%S}",name=name,task_status="pending",snapshot=snapshot,config=c,created_at=now)
-        db.add_all([t,r,EvaluationEvent(task_id=tid,stage="frozen",message="测试计划已创建并冻结输入版本。",status="success")]); db.commit(); db.refresh(t); return success(task_dict(t),"测试任务创建成功")
+        db.add_all([t,r,EvaluationEvent(task_id=tid,stage="frozen",message="测试计划已创建并冻结输入版本。",status="success")]); db.commit(); db.refresh(t); return success(task_dict(t, db),"测试任务创建成功")
 
 def change(tid, action):
     with SessionLocal() as db:
@@ -421,7 +469,18 @@ def change(tid, action):
                 db.add(EvaluationEvent(task_id=tid, stage="archived", message="已根据冻结的治理结果和人工标准答案完成真实计算。", status="succeeded"))
                 db.commit()
                 db.refresh(t)
-                return success(task_dict(t))
+                return success(task_dict(t, db))
+            if (run.snapshot or {}).get("modelComparison"):
+                comparison.apply_run(run)
+                run.task_status = "succeeded"
+                run.started_at = now
+                run.finished_at = now
+                run.allowed_actions = ["export"]
+                t.processed_count = t.total_count
+                t.judgment_status = run.judgment_status
+                db.add(EvaluationEvent(task_id=tid, stage="archived", message="已按固定的逐条前后回答重新计算指标。", status="succeeded"))
+                db.commit()
+                return success(task_dict(t, db))
             results=[]
             for index, revision in enumerate((run.snapshot or {}).get("metricRevisions", [])):
                 threshold=next((x for x in revision.get("thresholds", []) if x.get("stage") == t.target_stage), None)
@@ -433,7 +492,7 @@ def change(tid, action):
             if t.status not in ("pending","running"): raise HTTPException(400,"任务已结束")
             t.status="cancelled"; t.stage="archived"; t.finished_at=now; t.updated_at=now; t.allowed_actions=[]; msg="测试任务已取消。"
             db.query(EvaluationRun).filter(EvaluationRun.run_id==t.run_id).update({"task_status":"cancelled","finished_at":now})
-        db.add(EvaluationEvent(task_id=tid,stage=t.stage,message=msg,status=t.status)); db.commit(); db.refresh(t); return success(task_dict(t))
+        db.add(EvaluationEvent(task_id=tid,stage=t.stage,message=msg,status=t.status)); db.commit(); db.refresh(t); return success(task_dict(t, db))
 @router.post("/tasks/{task_id}/start")
 def start(task_id:str): return change(task_id,"start")
 @router.post("/tasks/{task_id}/cancel")
@@ -466,7 +525,7 @@ def retry(run_id: str, payload: dict[str, Any]):
             retry_of=run_id, task_status="pending", snapshot=previous.snapshot, config=previous.config, created_at=now)
         db.add_all([task, run, EvaluationEvent(task_id=task_id, stage="frozen", message=f"已创建重试任务：{reason}", status="success")])
         db.commit(); db.refresh(task)
-        return success(task_dict(task), "重试任务创建成功")
+        return success(task_dict(task, db), "重试任务创建成功")
 
 def filter_runs(
     rows,
@@ -564,6 +623,23 @@ def samples(run_id:str,metric_code:str,page:int=1,page_size:int=10,outcome:str|N
         if not run:
             raise HTTPException(404, "测试运行记录不存在")
         rows = []
+        if (run.snapshot or {}).get("modelComparison"):
+            if metric_code not in {m["metricCode"] for m in run.metric_results or []}:
+                raise HTTPException(400, "该运行不包含所选指标")
+            block = run.snapshot["modelComparison"]
+            if comparison.digest(block) != run.snapshot.get("modelComparisonHash"):
+                raise HTTPException(409, "对照明细指纹不一致")
+            group = dict(zip(comparison.CODES, ("risk", "target", "generalization", "retention")))[metric_code]
+            for sample in block["samples"]:
+                if sample["type"] != group:
+                    continue
+                correct = sample.get("after_judgment", {}).get("correct")
+                if outcome == "failed" and correct is True:
+                    continue
+                rows.append({"sampleId": sample["id"], "expectedDisplay": sample["rubric"],
+                             "predictedDisplay": sample["after"], "correct": correct,
+                             "reason": str(sample["errors"]) if sample["errors"] else sample["after_judgment"]["reason"],
+                             "includedInMetric": True, "required": True})
         if (run.snapshot or {}).get("riskEvaluation"):
             if metric_code not in {r["metricCode"] for r in run.metric_results or []}:
                 raise HTTPException(400, "该运行不包含所选指标")
@@ -586,6 +662,11 @@ def evidence(run_id:str):
     with SessionLocal() as db:
         run=db.get(EvaluationRun,run_id)
         if not run: raise HTTPException(404,"测试运行记录不存在")
+        if (run.snapshot or {}).get("modelComparison"):
+            entries = comparison.evidence_entries(run)
+            valid = bool(entries) and all(e["integrityState"] == "complete" for e in entries)
+            return success({"entries": entries, "integrityState": "complete" if valid else "corrupt",
+                            "checks": [{"name": "hash", "valid": valid}]})
         if (run.snapshot or {}).get("riskEvaluation"):
             entries = risk_eval.evidence_entries(run)
             valid = bool(entries) and len(entries) == len(run.metric_results or []) and all(e["integrityState"] == "complete" for e in entries)
@@ -602,6 +683,11 @@ def evidence_detail(evidence_id: str):
     with SessionLocal() as db:
         runs = db.scalars(select(EvaluationRun)).all()
         for run in runs:
+            if (run.snapshot or {}).get("modelComparison"):
+                for entry in comparison.evidence_entries(run):
+                    if entry["evidenceId"] == evidence_id:
+                        return success(entry)
+                continue
             if (run.snapshot or {}).get("riskEvaluation"):
                 for entry in risk_eval.evidence_entries(run):
                     if entry["evidenceId"] == evidence_id:
@@ -624,6 +710,14 @@ def create_export(run_id: str, payload: dict[str, Any]):
         if not run:
             raise HTTPException(404, "测试运行记录不存在")
         document = None
+        if (run.snapshot or {}).get("modelComparison"):
+            import json
+            entries = comparison.evidence_entries(run)
+            if run.task_status != "succeeded" or not entries or any(e["integrityState"] != "complete" for e in entries):
+                raise HTTPException(409, "对照评估未完成或指纹核验未通过")
+            document = json.dumps({"schemaVersion": comparison.VERSION, "runId": run_id,
+                                   "comparison": run.snapshot["modelComparison"], "metrics": run.metric_results,
+                                   "evidence": entries}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         if (run.snapshot or {}).get("riskEvaluation"):
             entries = risk_eval.evidence_entries(run)
             if run.task_status != "succeeded" or not entries or any(e["integrityState"] != "complete" for e in entries):
@@ -693,6 +787,8 @@ def contexts(kind:str="task_result",keyword:str=""):
     with SessionLocal() as db:
         if kind == "task_result":
             candidates = risk_eval.list_sources(db, keyword)
+        elif kind == "model_comparison":
+            candidates = comparison.list_sources(db, keyword)
         else:
             candidate = source_context(db) if kind == "dataset_snapshot" else None
             candidates = [candidate] if candidate and (not keyword or keyword.lower() in candidate["name"].lower()) else []

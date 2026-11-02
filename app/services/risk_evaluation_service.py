@@ -110,7 +110,7 @@ def source_context(row):
         "sourceModule": module, "sourceTaskId": row["task_id"],
         "sourceTraceId": row["task_id"], "taskTraceId": row["task_id"],
         "capabilityCode": kind, "status": "succeeded", "algorithmMode": "mock" if summary.get("data_source") == "mock" else "llm",
-        "datasetId": str(scope["dataset_id"]), "modelId": row["model_id"],
+        "datasetId": str(scope["dataset_id"]), "datasetName": summary.get("dataset_name", ""), "modelId": row["model_id"],
         "datasetVersion": version, "labelVersion": f"{scope['version_id']} {label_name}",
         "modelVersion": row["model_version"], "evaluatorVersion": VERSION,
         "contentHash": digest({"id": result_id, "summary": summary}),
