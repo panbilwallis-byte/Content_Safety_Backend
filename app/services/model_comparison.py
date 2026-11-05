@@ -43,6 +43,57 @@ def owner(token):
     return hashlib.sha256(token[7:].encode()).hexdigest()
 
 
+LLM_ACCESS_TOKEN = os.getenv("LLM_ACCESS_TOKEN", "")
+
+
+def server_token() -> str:
+    """后台流程只允许使用本服务配置的模型服务令牌。
+
+    浏览器带的那把是平台登录令牌，8001 不认；转过去只会换回 401，
+    前端又按"平台登录失效"处理，表现成"点一下就被告知下线"。
+    """
+    token = (LLM_ACCESS_TOKEN or "").strip()
+    if not token:
+        raise HTTPException(
+            501, "本服务未配置模型服务访问令牌（环境变量 LLM_ACCESS_TOKEN），无法自动登记评估绑定")
+    return token if token.startswith("Bearer ") else f"Bearer {token}"
+
+
+def prepare_edit_binding(platform_model_id: int, version: str) -> dict:
+    """请 8001 按基线模板为编辑产物写好评估绑定；8001 侧幂等，重复调用安全。"""
+    try:
+        binding = llm("/model-evaluation/prepare-edit", server_token(),
+                      {"platform_model_id": platform_model_id, "version": version})
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+        return {"status": "pending", "message": detail}
+    return {"status": "bound", "mode": binding.get("mode") or "",
+            "policy_version": binding.get("policy_version") or "",
+            "message": "评估绑定已就绪"}
+
+
+def ensure_edit_binding(db, *, task_id: str, model_id: int, version: str,
+                        result: dict, trace_id: str | None = None) -> dict:
+    """编辑产物一登记就把评估绑定写好，并把结果留在任务流水里。
+
+    失败不推翻任务：版本产物是真的，绑定只是评估前置，原因如实记成合规事件，
+    下次发起评估时 8001 那条 lazy 调用还会再补一次。
+    """
+    from app.repositories.task_repository import update
+    from app.services.compliance_event_service import add_event
+
+    outcome = prepare_edit_binding(model_id, version)
+    result["evaluation_binding"] = outcome
+    if outcome["status"] != "bound":
+        add_event(db, subject_type="model_version", subject_id=f"{model_id}:{version}",
+                  event_type="评估绑定未就绪", level="medium",
+                  detail=f"编辑产物 {version} 自动登记评估推理绑定失败：{outcome['message']}",
+                  trace_id=trace_id)
+    update(task_id, {"result": result}, db)
+    db.commit()
+    return outcome
+
+
 def freeze_questions(db, dataset_id, version_ref):
     dataset = db.get(Dataset, dataset_id)
     version = resolve_version(db, dataset_id, version_ref)

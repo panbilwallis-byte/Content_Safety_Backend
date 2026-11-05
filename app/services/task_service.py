@@ -15,6 +15,7 @@ from app.repositories.audit_repository import add_log
 from app.services.compliance_event_service import add_event
 from app.services.dataset_version_service import create_ingest_version
 from app.services.lineage_service import record_ingest_edge
+from app.services.model_comparison import ensure_edit_binding
 from app.repositories.evaluation_repository import save_evaluation
 from app.repositories.resource_repository import (
     find_metric,
@@ -604,11 +605,17 @@ def run_mock_task(
 
             # 风险知识编辑成功后登记真实的编辑后版本，并把结果里的版本字段改为实际值，
             # 替换模拟适配器写死的 v1.0.0/v1.0.1，保证任务流水与 model_versions 对得上。
+            edit_binding_target = None
             if request.capability_code == "knowledge_edit" and status == "succeeded":
                 edit_baseline, edit_edited = register_edited_version(db, task_id, input_data, request.config)
                 if edit_edited:
                     result["before_version"] = edit_baseline
                     result["after_version"] = edit_edited
+                    try:
+                        edit_binding_target = (int(input_data.get("model_id") or input_data.get("modelId")),
+                                               edit_edited)
+                    except (TypeError, ValueError):
+                        edit_binding_target = None
 
             # 更新任务结果
             finished_task = update(
@@ -644,6 +651,12 @@ def run_mock_task(
 
             # 提交事务
             db.commit()
+
+            # 编辑产物一落账就顺手写好评估绑定。必须在上面这次 commit 之后：
+            # 8001 的 prepare-edit 用自己的连接读 model_versions/tasks，看不到未提交的行。
+            if edit_binding_target is not None:
+                ensure_edit_binding(db, task_id=task_id, model_id=edit_binding_target[0],
+                                    version=edit_binding_target[1], result=result, trace_id=trace_id)
 
             return finished_task
 
