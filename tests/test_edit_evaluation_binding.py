@@ -121,6 +121,15 @@ class EditEvaluationBindingTest(unittest.TestCase):
         self.assertIn("8001", outcome["message"])
         self.assertEqual(len(self._events()), 1)
 
+    def test_unexpected_error_still_leaves_the_succeeded_task_alone(self):
+        fake = RecordingLlm(error=AttributeError("'NoneType' object has no attribute 'get'"))
+        with patch.object(comparison, "llm", fake):
+            outcome = self._ensure()
+        self.assertEqual(outcome["status"], "pending")
+        self.assertIn("NoneType", outcome["message"])
+        self.assertEqual(self._task().status, "succeeded")
+        self.assertEqual(len(self._events()), 1)
+
     def test_result_written_survives_the_commit(self):
         with patch.object(comparison, "llm", RecordingLlm(
                 result={"mode": "simulated_policy", "policy_version": "v1", "model_id": "m"})):

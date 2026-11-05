@@ -64,9 +64,10 @@ def prepare_edit_binding(platform_model_id: int, version: str) -> dict:
     try:
         binding = llm("/model-evaluation/prepare-edit", server_token(),
                       {"platform_model_id": platform_model_id, "version": version})
-    except HTTPException as exc:
-        detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
-        return {"status": "pending", "message": detail}
+    except Exception as exc:  # noqa: BLE001
+        # 这里任何意外都只该让绑定停在"未就绪"，不能顺着调用栈把已成功的编辑任务判成失败。
+        detail = exc.detail if isinstance(exc, HTTPException) and isinstance(exc.detail, str) else str(exc)
+        return {"status": "pending", "message": detail or exc.__class__.__name__}
     return {"status": "bound", "mode": binding.get("mode") or "",
             "policy_version": binding.get("policy_version") or "",
             "message": "评估绑定已就绪"}
