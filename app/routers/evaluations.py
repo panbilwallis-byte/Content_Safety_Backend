@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Literal
 from datetime import datetime, timedelta
 from uuid import uuid4
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -11,9 +11,37 @@ from app.core.time import now_shanghai
 from app.models.tables import Dataset, Model, EvaluationMetric, EvaluationMetricRevision, EvaluationTask, EvaluationRun, EvaluationEvent, EvaluationWorkspaceItem
 from app.services import risk_evaluation_service as risk_eval
 from app.services import model_comparison as comparison
+from app.services import audit_evaluation as audit_eval
 
 router = APIRouter()
 _preflights: dict[str, tuple[datetime, str]] = {}
+
+
+class AuditSnapshotRequest(BaseModel):
+    kind: Literal["lineage", "task", "checkpoints"]
+    entity_type: Literal["dataset", "model", "task", "training_task"]
+    entity_id: str = Field(min_length=1, max_length=100)
+    version_id: str = Field(default="", max_length=100)
+    direction: Literal["upstream", "downstream", "both"] = "both"
+
+
+@router.post("/evaluation/audit-snapshots")
+def create_audit_snapshot(body: AuditSnapshotRequest, request: Request):
+    expected = {"task": {"task"}, "checkpoints": {"training_task"}, "lineage": {"dataset", "model"}}
+    if body.entity_type not in expected[body.kind]:
+        raise HTTPException(422, "审计类别与对象类型不匹配")
+    actor = getattr(request.state, "user", {}).get("uid")
+    with SessionLocal() as db:
+        source = audit_eval.create_snapshot(db, body, actor)
+        db.commit()
+        return success(source, "审计快照已保存，可到测试评估引用")
+
+
+@router.get("/evaluation/audit-snapshots/{snapshot_id}")
+def audit_snapshot_detail(snapshot_id: str, version_id: str):
+    with SessionLocal() as db:
+        ref = {"entityId": snapshot_id, "versionId": version_id}
+        return success({"source": audit_eval.resolve_source(db, ref), "snapshot": audit_eval.freeze(db, ref)})
 
 def iso(v): return v.isoformat() if v else None
 def rev_dict(r):
@@ -82,6 +110,8 @@ def source_context(db):
             "capturedAt":iso(dataset.created_at), "interface":"数据库数据集快照"}
 
 def resolve_context(db, ref):
+    if config_value(ref, "entityType") == "audit_record":
+        return audit_eval.resolve_source(db, ref)
     if config_value(ref, "entityType") == "model_comparison":
         return comparison.resolve_source(db, ref)
     if config_value(ref, "entityType") == "task_result":
@@ -122,6 +152,12 @@ def preflight_issues(db, config: dict[str, Any]) -> list[dict[str, str]]:
         ref = source_refs[0]
         try:
             source = resolve_context(db, ref)
+            if source["entityType"] == "audit_record":
+                if config_value(config, "executionMode") != "reference" or config_value(config, "sampleScope", {"mode": "all"}) != {"mode": "all"}:
+                    raise HTTPException(400, "审计评估只支持引用完整固定快照")
+                for field, key in (("datasetVersionRef", "datasetVersion"), ("labelVersionRef", "labelVersion"), ("modelVersionRef", "modelVersion")):
+                    if config_value(config, field) != source[key]:
+                        raise HTTPException(400, "审计来源的数据、规则或模型版本不一致")
             if source["entityType"] == "model_comparison":
                 if config_value(config, "executionMode") != "reference":
                     raise HTTPException(400, "模型对照仅支持引用已有结果，重新推理请回模型评估页")
@@ -149,6 +185,13 @@ def preflight_issues(db, config: dict[str, Any]) -> list[dict[str, str]]:
         published = {revision.revision_id for revision in revisions if revision.configuration_status == "published"}
         if set(revision_refs) != published:
             issues.append({"field": "metricRevisionRefs", "reasonCode": "metric_unavailable", "message": "包含未发布或不存在的指标修订，请刷新后重新选择。"})
+        if source and source["entityType"] == "audit_record":
+            for revision in revisions:
+                thresholds = (revision.definition or {}).get("thresholds", [])
+                if (revision.metric_code not in source["supportedMetricCodes"] or
+                        db.get(EvaluationMetric, revision.metric_id).status != "enabled" or
+                        not any(t.get("stage") == config_value(config, "targetStage") and t.get("comparator") in {"gte", "lte", "eq"} and isinstance(t.get("value"), (int, float)) for t in thresholds)):
+                    issues.append({"field": "metricRevisionRefs", "reasonCode": "metric_unavailable", "message": "指标或目标阶段不适用于此审计快照"})
         if source and source["entityType"] == "model_comparison":
             for revision in revisions:
                 if (revision.metric_code not in comparison.CODES
@@ -433,7 +476,11 @@ def create_task(body:CreateTask, request:Request):
                   "modelVersion":t.model_version,"sampleManifestHash":"数据库快照", "sampleCount":t.total_count,
                   "sourceResultHashes":[source["contentHash"]] if source else [], "evaluatorVersion":"backend-1.0",
                   "executionMode":config_value(c,"executionMode","reference"), "createdAt":iso(now), "targetStage":t.target_stage}
-        if source["entityType"] == "task_result":
+        if source["entityType"] == "audit_record":
+            block = audit_eval.freeze(db, source)
+            snapshot.update(auditEvaluation=block, auditEvaluationHash=audit_eval.digest(block),
+                            sampleManifestHash=audit_eval.digest(block), evaluatorVersion=audit_eval.VERSION)
+        elif source["entityType"] == "task_result":
             block = risk_eval.freeze_source(db, source)
             snapshot.update(riskEvaluation=block, riskEvaluationHash=risk_eval.digest(block),
                             sampleManifestHash=block["manifestHash"], sourceResultHashes=[block["sourceHash"]],
@@ -458,6 +505,17 @@ def change(tid, action):
             run = db.get(EvaluationRun, t.run_id)
             if run is None:
                 raise HTTPException(409, "任务缺少对应运行记录，无法执行")
+            if (run.snapshot or {}).get("auditEvaluation"):
+                run.finished_at = now
+                audit_eval.calculate(run)
+                run.task_status = "succeeded"
+                run.started_at = now
+                run.allowed_actions = ["export"]
+                t.processed_count = t.total_count
+                t.judgment_status = run.judgment_status
+                db.add(EvaluationEvent(task_id=tid, stage="archived", message="已按固定规则核验审计快照，缺失与无法核验项均保留。", status="succeeded"))
+                db.commit()
+                return success(task_dict(t, db))
             if (run.snapshot or {}).get("riskEvaluation"):
                 run.finished_at = now
                 risk_eval.calculate(run)
@@ -623,6 +681,13 @@ def samples(run_id:str,metric_code:str,page:int=1,page_size:int=10,outcome:str|N
         if not run:
             raise HTTPException(404, "测试运行记录不存在")
         rows = []
+        if (run.snapshot or {}).get("auditEvaluation"):
+            if metric_code not in {m["metricCode"] for m in run.metric_results or []}:
+                raise HTTPException(400, "该运行不包含所选指标")
+            block = run.snapshot["auditEvaluation"]
+            if audit_eval.digest(block) != run.snapshot.get("auditEvaluationHash"):
+                raise HTTPException(409, "审计逐项明细指纹不一致")
+            rows = [{**s, "includedInMetric": True} for s in block["samples"] if outcome != "failed" or s["correct"] is not True]
         if (run.snapshot or {}).get("modelComparison"):
             if metric_code not in {m["metricCode"] for m in run.metric_results or []}:
                 raise HTTPException(400, "该运行不包含所选指标")
@@ -662,6 +727,10 @@ def evidence(run_id:str):
     with SessionLocal() as db:
         run=db.get(EvaluationRun,run_id)
         if not run: raise HTTPException(404,"测试运行记录不存在")
+        if (run.snapshot or {}).get("auditEvaluation"):
+            entries = audit_eval.evidence_entries(run)
+            valid = bool(entries) and len(entries) == len(run.metric_results or []) and all(e["integrityState"] == "complete" for e in entries)
+            return success({"entries": entries, "integrityState": "complete" if valid else "corrupt", "checks": [{"name": "hash", "valid": valid}]})
         if (run.snapshot or {}).get("modelComparison"):
             entries = comparison.evidence_entries(run)
             valid = bool(entries) and all(e["integrityState"] == "complete" for e in entries)
@@ -683,6 +752,11 @@ def evidence_detail(evidence_id: str):
     with SessionLocal() as db:
         runs = db.scalars(select(EvaluationRun)).all()
         for run in runs:
+            if (run.snapshot or {}).get("auditEvaluation"):
+                for entry in audit_eval.evidence_entries(run):
+                    if entry["evidenceId"] == evidence_id:
+                        return success(entry)
+                continue
             if (run.snapshot or {}).get("modelComparison"):
                 for entry in comparison.evidence_entries(run):
                     if entry["evidenceId"] == evidence_id:
@@ -710,6 +784,14 @@ def create_export(run_id: str, payload: dict[str, Any]):
         if not run:
             raise HTTPException(404, "测试运行记录不存在")
         document = None
+        if (run.snapshot or {}).get("auditEvaluation"):
+            import json
+            entries = audit_eval.evidence_entries(run)
+            if run.task_status != "succeeded" or len(entries) != len(run.metric_results or []) or not entries or any(e["integrityState"] != "complete" for e in entries):
+                raise HTTPException(409, "审计评估未完成或证据核验未通过")
+            document = json.dumps({"schemaVersion": audit_eval.VERSION, "runId": run_id, "source": run.snapshot["resolvedRefs"],
+                                   "audit": run.snapshot["auditEvaluation"], "metrics": run.metric_results, "evidence": entries},
+                                  ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         if (run.snapshot or {}).get("modelComparison"):
             import json
             entries = comparison.evidence_entries(run)
@@ -785,7 +867,9 @@ def preflight(config:dict[str,Any]):
 @router.get("/evaluation/contexts")
 def contexts(kind:str="task_result",keyword:str=""):
     with SessionLocal() as db:
-        if kind == "task_result":
+        if kind == "audit_record":
+            candidates = audit_eval.list_sources(db, keyword)
+        elif kind == "task_result":
             candidates = risk_eval.list_sources(db, keyword)
         elif kind == "model_comparison":
             candidates = comparison.list_sources(db, keyword)
