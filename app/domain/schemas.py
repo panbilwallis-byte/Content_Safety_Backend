@@ -1,3 +1,4 @@
+from typing import Literal
 from typing import Any
 from pydantic import BaseModel, Field, field_validator
 
@@ -148,6 +149,10 @@ class UpgradeModelServiceRequest(BaseModel):
 
 class RecordModelCallRequest(BaseModel):
     """模型调用页真实调用模型服务成功后的留痕回写请求体。"""
+
+    assessment_status: Literal["assessed", "partial", "unavailable"] | None = None
+    unavailable_fields: list[str] = Field(default_factory=list)
+    assessment_reason: str | None = None
 
     model_id: str | int
     service_id: str = Field(min_length=1, max_length=64)

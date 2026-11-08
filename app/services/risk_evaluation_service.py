@@ -18,16 +18,16 @@ from app.services.dataset_version_service import resolve_version, manifest_hash
 
 METRICS = {
     "risk_level_accuracy": ("风险等级准确率", "accuracy", "gte", .95,
-                            "四档等级完全一致数 / 全部有标准答案的样本数（失败、无法判断及提示不计为正确）"),
+                            "四档等级完全一致数 / 有标准答案的有效预测样本数（新协议无法判断样本排除，旧快照口径不变）"),
     "risk_high_recall": ("高风险检出率", "recall", "gte", .95,
-                         "正确判为高风险数 / 人工标为高风险的全部样本数（含失败及无法判断）"),
+                         "正确判为高风险数 / 人工标为高风险的样本数（新协议无法判断样本排除）"),
     "risk_safe_fpr": ("安全样本误报率", "fpr", "lte", .05,
                       "安全样本中被列为风险候选数（含提示） / 人工标为安全的全部样本数；缺失判断时不作达标结论"),
 }
 METRICS.update({
-    "value_tier_accuracy": ("价值档位准确率", "accuracy", "gte", .95, "价值档位完全一致数 / 全部有人工价值档位的样本数（失败及不可评估不计正确）"),
+    "value_tier_accuracy": ("价值档位准确率", "accuracy", "gte", .95, "价值档位完全一致数 / 有人工价值档位的样本数（新协议不可评估样本排除）"),
     "value_high_recall": ("高价值检出率", "recall", "gte", .95, "正确判为高价值数 / 人工标为高价值的全部样本数"),
-    "anomaly_accuracy": ("异常识别准确率", "accuracy", "gte", .95, "正常或异常判断正确数 / 全部有人工异常标注的样本数（失败及不可评估不计正确）"),
+    "anomaly_accuracy": ("异常识别准确率", "accuracy", "gte", .95, "正常或异常判断正确数 / 有人工异常标注的样本数（新协议不可评估样本排除）"),
     "anomaly_recall": ("异常检出率", "recall", "gte", .95, "正确检出的异常样本数 / 人工标为异常的全部样本数"),
     "anomaly_normal_fpr": ("正常样本误报率", "fpr", "lte", .05, "正常样本中被判为异常数 / 人工标为正常的全部样本数；缺失判断时不作达标结论"),
 })
@@ -179,7 +179,7 @@ def freeze_source(db, source):
         status = "failed"
         reason = output.get("error_detail") or checkpoint["error_code"] or "未返回有效判断"
         if checkpoint["status"] == "success":
-            if output.get("status") == "unassessable":
+            if output.get("status") == "unassessable" or output.get("assessment_status") == "unavailable":
                 status, reason = "unassessable", output.get("unassessableReason") or "无法判断"
             elif output.get("status") == "assessed":
                 levels = [f.get("suggestedLevel") for f in output.get("findings", [])]
@@ -190,7 +190,7 @@ def freeze_source(db, source):
         correct = prediction == ref if ref is not None and prediction in LEVELS else None
         samples.append({"sampleId": sid, "expectedLevel": ref, "predictedLevel": prediction,
                         "predictionStatus": status, "correct": correct, "reason": reason,
-                        "expected": None, "predicted": None, "baseline": None, "required": ref is not None})
+                        "expected": None, "predicted": None, "baseline": None, "required": ref is not None, "assessmentUnavailable": output.get("assessment_status") == "unavailable"})
     if not any(s["required"] for s in samples):
         raise HTTPException(400, "来源没有人工标准答案，无法计算风险准确率")
     block = {"version": VERSION, "sourceResultId": row["id"], "sourceTaskId": row["task_id"],
@@ -246,7 +246,7 @@ def freeze_governance(db, row, scope, summary):
         reason = output.get("error_detail") or checkpoint["error_code"] or "未得到有效判断"
         score = None
         if checkpoint["status"] == "success":
-            unavailable = output.get("status") == "unavailable"
+            unavailable = output.get("status") == "unavailable" or output.get("assessment_status") == "unavailable" or bool(output.get("unavailable_fields"))
             if unavailable:
                 status, reason = "unassessable", output.get("unavailable_reason") or output.get("unavailableReason") or "不可评估"
             elif kind == "governance-value" and output.get("status") == "scored":
@@ -271,7 +271,7 @@ def freeze_governance(db, row, scope, summary):
                         "expectedDisplay": display.get(expected, "无标准答案"), "predictedDisplay": display.get(predicted, "无法判断" if status == "unassessable" else "检测失败"),
                         "predictionStatus": status, "correct": predicted == expected if expected is not None and predicted is not None else None,
                         "reason": reason, "expected": None, "predicted": None, "baseline": None,
-                        "required": ref is not None, "score": score, "judgmentType": kind})
+                        "required": ref is not None, "assessmentUnavailable": unavailable if checkpoint["status"] == "success" else False, "score": score, "judgmentType": kind})
     if not any(s["required"] for s in samples):
         allowed = "high / medium / low" if kind == "governance-value" else "true（异常）/ false（正常），必须为布尔值"
         raise HTTPException(400, f"缺少人工标准答案：请在数据记录中补充 {field}（{allowed}），创建固定版本并重新分析")
@@ -281,7 +281,7 @@ def freeze_governance(db, row, scope, summary):
 
 
 def metric_includes(sample, code):
-    if not sample["required"]:
+    if not sample["required"] or sample.get("assessmentUnavailable"):
         return False
     if code in {"risk_high_recall", "value_high_recall"}:
         return sample["expectedLevel"] == "high"

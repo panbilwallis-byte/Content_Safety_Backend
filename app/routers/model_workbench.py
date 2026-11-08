@@ -125,6 +125,9 @@ def current_model_workbench():
         versions = list(db.scalars(select(ModelVersion).order_by(ModelVersion.created_at.desc())).all())
         services = list(db.scalars(select(ModelService)).all())
         calls = list(db.scalars(select(ModelCall).order_by(ModelCall.created_at.desc())).all())
+        call_metadata = {task.task_id: {key: (task.result or {})[key]
+                         for key in ("assessment_status", "unavailable_fields", "assessment_reason") if key in (task.result or {})}
+                         for task in db.scalars(select(Task).where(Task.task_id.in_([call.id for call in calls]))).all()}
         version_map: dict[int, list[ModelVersion]] = {}
         for version in versions:
             version_map.setdefault(version.model_id, []).append(version)
@@ -149,7 +152,7 @@ def current_model_workbench():
             "models": [_model_payload(model, version_map.get(model.id, []), {task.task_id: task for task in edit_tasks}) for model in models],
             "training": [training_task_payload(task) for task in training_tasks],
             "services": [_service_payload(service) for service in services],
-            "calls": [{"id": c.id, "model_id": c.model_id, "service_id": c.service_id, "version": c.version, "prompt": c.prompt, "original_output": c.original_output, "governed_output": c.governed_output, "reason": c.reason, "risk_level": c.risk_level, "reconstruction": c.reconstruction, "elapsed_ms": c.elapsed_ms, "created_at": c.created_at.isoformat(), "status": c.status, "trace_id": c.trace_id} for c in calls],
+            "calls": [{"id": c.id, "model_id": c.model_id, "service_id": c.service_id, "version": c.version, "prompt": c.prompt, "original_output": c.original_output, "governed_output": c.governed_output, "reason": c.reason, "risk_level": c.risk_level, "reconstruction": c.reconstruction, "elapsed_ms": c.elapsed_ms, "created_at": c.created_at.isoformat(), "status": c.status, "trace_id": c.trace_id, **call_metadata.get(c.id, {})} for c in calls],
             "assessment": assessment, "changes": [],
             "datasets": [
                 {
@@ -345,6 +348,14 @@ def record_model_call(request: RecordModelCallRequest):
         db.flush()
         record_call_edge(db, call)
         sync_model_call_tasks(db)
+        if request.assessment_status is not None:
+            ledger = db.scalar(select(Task).where(Task.task_id == call.id))
+            ledger.result = {**(ledger.result or {}),
+                             "assessment_status": request.assessment_status,
+                             "unavailable_fields": request.unavailable_fields,
+                             "assessment_reason": request.assessment_reason}
+            if request.assessment_status == "unavailable":
+                ledger.success_count = 0
         db.commit()
         return success(data={"id": call.id}, message="调用留痕已登记")
 

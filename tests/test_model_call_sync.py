@@ -70,6 +70,23 @@ class ModelCallTaskSyncTest(unittest.TestCase):
                 ComplianceEvent.subject_id == call_id))
             self.assertIsNone(event)
 
+    def test_unavailable_metadata_round_trips_without_schema_migration_or_risk_event(self):
+        result = model_workbench.record_model_call(RecordModelCallRequest(
+            model_id=7, service_id="SVC-T-1", prompt="资料不足", original_output="无法判断",
+            governed_output="资料不足，无法判断", reason="模型结果无法可靠判定", risk_level="unknown",
+            elapsed_ms=25, assessment_status="unavailable", unavailable_fields=["riskLevel"],
+            assessment_reason="资料不足，无法判断"))
+        call_id = result["data"]["id"]
+        with self.Session() as db:
+            task = db.get(Task, call_id)
+            self.assertEqual(task.result["assessment_status"], "unavailable")
+            self.assertEqual(task.success_count, 0)
+            self.assertIsNone(db.scalar(select(ComplianceEvent).where(ComplianceEvent.subject_id == call_id)))
+        payload = model_workbench.current_model_workbench()["data"]
+        call = next(c for c in payload["calls"] if c["id"] == call_id)
+        self.assertEqual(call["assessment_status"], "unavailable")
+        self.assertEqual(call["unavailable_fields"], ["riskLevel"])
+
 
 if __name__ == "__main__":
     unittest.main()
