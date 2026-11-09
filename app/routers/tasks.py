@@ -286,6 +286,31 @@ def execute_task(
         or str(uuid4())
     )
 
+    # Keep the new domain outside the legacy catch-all that wraps failures as HTTP 200.
+    if request.capability_code in {"agent_trace_export", "agent_trace_ingest"}:
+        from app.routers.agent_traces import actor
+        from app.services.agent_trace_export import create_task, run_export
+        from app.repositories.task_repository import task_to_dict
+        from fastapi.responses import JSONResponse
+        with SessionLocal() as db:
+            try:
+                user = actor(http_request, db)
+                if request.capability_code == "agent_trace_ingest":
+                    from app.services.agent_trace_ingest import submit, run
+                    data, created = submit(db, request.input, user, http_request.headers.get("X-Request-Id"), request.name)
+                    if created:
+                        background_tasks.add_task(run, data["task_id"])
+                    return success(data=data, trace_id=trace_id)
+                task, created = create_task(db, request.input, user,
+                    http_request.headers.get("X-Request-Id"), request.name)
+                data = task_to_dict(task)
+                if created:
+                    background_tasks.add_task(run_export, task.task_id)
+                return success(data=data, trace_id=trace_id)
+            except HTTPException as exc:
+                return JSONResponse(status_code=exc.status_code,
+                    content=fail(message=str(exc.detail), code=exc.status_code, trace_id=trace_id))
+
     try:
         if request.capability_code in {
             "lineage_audit", "training_monitor", "reasoning_audit",
@@ -376,7 +401,17 @@ def get_tasks(
 
 # 根据任务 ID 查询一条任务
 @router.get("/tasks/{task_id}", response_model=ApiResponse)
-def get_task_detail(task_id: str, kind: str | None = Query(default=None)):
+def get_task_detail(task_id: str, kind: str | None = Query(default=None), http_request: Request = None):
+    if task_id.startswith(("tr_export_", "tr_ingest_")):
+        from app.routers.agent_traces import actor
+        from app.services.agent_trace_export import owner_task
+        from app.repositories.task_repository import task_to_dict
+        from fastapi.responses import JSONResponse
+        with SessionLocal() as db:
+            try:
+                return success(task_to_dict(owner_task(db, task_id, actor(http_request, db))))
+            except HTTPException as exc:
+                return JSONResponse(status_code=exc.status_code, content=fail(str(exc.detail), code=exc.status_code))
     # 兼容风险识别前端使用的统一任务查询路径。风险任务暂存在
     # data_governance 路由模块的会话内存中，不落在通用 Task 表。
     if kind == "governance-risk" or task_id.startswith("risk-task-"):

@@ -134,7 +134,9 @@ DATABASE_URL = URL.create(
 # 创建数据库引擎。仅在启用 SSH 时传入自定义连接创建器。
 engine_options = {
     "pool_pre_ping": True,
-    "echo": True,
+    "echo": os.getenv("SQL_ECHO", "false").lower() == "true",
+    # Audit imports contain source text and credentials may appear in arbitrary payloads.
+    "hide_parameters": True,
 }
 if ssh_mysql_connector:
     engine_options["creator"] = ssh_mysql_connector.connect

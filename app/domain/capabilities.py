@@ -2,6 +2,8 @@
 # label：给页面和接口文档展示的中文名称
 
 CAPABILITIES = {
+    "agent_trace_ingest": {"label": "智能体轨迹解析", "category": "全链路合规", "topic": "t4"},
+    "agent_trace_export": {"label": "智能体轨迹导出", "category": "全链路合规", "topic": "t4"},
     # 课题一：数据价值
     "data_ingest": {
         "label": "数据接入",

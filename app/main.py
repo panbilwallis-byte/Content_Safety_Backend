@@ -11,6 +11,11 @@ from app.core.database import (
 )
 
 from app.models import tables
+from app.models import agent_traces as agent_trace_models
+from app.routers import agent_traces as agent_trace_router
+from app.core.audit_logging import protect_download_access_logs
+
+protect_download_access_logs()
 from app.routers import (
     auth,
     tasks,
@@ -120,8 +125,14 @@ async def lifespan(app: FastAPI):
     # 谱系边台账补登：把已登记的接入/清洗/训练/调用关系写成边，重启不翻倍 (#13-1.6)。
     ensure_lineage_edges_backfill()
 
+    from app.services.agent_trace_sync import TraceSynchronizer
+    trace_sync = TraceSynchronizer()
+    trace_sync.start()
     print("MySQL 数据表初始化完成")
-    yield
+    try:
+        yield
+    finally:
+        trace_sync.close()
 
     close_database_connection()
     print("后端服务已关闭")
@@ -151,6 +162,10 @@ async def enforce_platform_auth(request: Request, call_next):
     CORS 在本中间件之后注册、处于更外层，预检与错误响应都会带上跨域头。
     """
     path = request.url.path
+    # Only this exact binary route accepts a signed, expiring artifact ticket.
+    # Its handler independently checks actor status, permissions, source authorization and hash.
+    if request.method == "GET" and path == "/api/v1/compliance/agent-traces/downloads":
+        return await call_next(request)
     if request.method == "OPTIONS" or not path.startswith("/api/v1") or path in AUTH_WHITELIST:
         return await call_next(request)
     header = request.headers.get("authorization", "")
@@ -312,6 +327,7 @@ app.include_router(
 
 
 app.include_router(model_comparison_router, prefix="/api/v1", tags=["模型真实对照评估"])
+app.include_router(agent_trace_router.router, prefix="/api/v1", tags=["智能体轨迹工具交互"])
 
 @app.get("/health")
 def health():
