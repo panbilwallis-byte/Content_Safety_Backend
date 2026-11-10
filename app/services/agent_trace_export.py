@@ -231,7 +231,7 @@ def build_artifact(db, task):
     manifest = {"schema_version": "1", **document["scope"], "created_at": now_shanghai().isoformat() + "+08:00",
         "sample_count": 1, "call_count": len(document["calls"]), "event_count": len(document["events"]),
         "redaction_profile": "standard", "anonymize_ids": True, "anonymization_policy": "package-salted-v1",
-        "data_origin": sample.payload["data_origin"], "notice": "含模拟过程，不作为真实风险审计证据",
+        "data_origin": sample.payload["data_origin"], "notice": ("源日志实际记录；风险结论以明确记录的审计结果为准" if sample.payload["data_origin"] == "actual" else "含模拟过程，不作为真实风险审计证据"),
         "generation_policy_version": sample.payload.get("generation_policy_version"), "ui_version": data.get("ui_version", "agent-trace-tools-v1"),
         "contents": sorted(contents), "warnings": ["原始日志默认不导出"],
         "files": [{"path": name, "size_bytes": len(body), "sha256": hashlib.sha256(body).hexdigest(),

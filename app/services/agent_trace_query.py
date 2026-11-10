@@ -144,6 +144,9 @@ def offset(token, scope, trace, kind, user):
 
 
 def llm_access(db, batch):
+    from app.services.agent_trace_sources import visible
+    if not visible(batch):
+        fail(404, "该历史模拟批次已隐藏，请选择实际上传的轨迹批次")
     if batch.source_system != "llm":
         return
     if batch.source_token_hash != sync.llm_owner():
@@ -200,8 +203,8 @@ def sample_summary(row):
             "event_count": p["event_count"], "call_count": p["call_count"], "duration_ms": p.get("duration_ms"),
             "risk_level": p.get("risk_level", "unknown"), "audit_decision": p.get("audit_decision", "unknown"),
             "risk_types": p.get("risk_types", []), "ingest_order": row.ingest_order,
-            "data_origin": p["data_origin"], "sample_id": row.sample_id,
-            "source_id": p["source"]["source_id"], "test_category": p.get("test_category")}
+            "data_origin": p["data_origin"], "sample_id": row.sample_id, "original_sample_id": p.get("original_sample_id", row.sample_id),
+            "source_id": p["source"]["source_id"], "test_category": p.get("test_category"), "rule_audit": p.get("rule_audit"), "rule_findings": redact(p.get("rule_findings", []), preserve_ids=True)}
 
 
 def sample_statement(scope, params):
@@ -265,8 +268,9 @@ def workspace(db, params, view, user):
                 "active_snapshot_id": b.active_snapshot_id, "availability": "available"})
     options = page(accessible, number(params, "batch_option_page", 1, 2_147_483_647),
                    number(params, "option_page_size", 50))
+    from app.services.agent_trace_sources import legacy_enabled
     warnings = [{"code": "source_unavailable", "message": r.message, "panel": "options"}
-                for r in db.scalars(select(TraceIngestCheckpoint).where(TraceIngestCheckpoint.status != "succeeded").limit(20))]
+                for r in db.scalars(select(TraceIngestCheckpoint).where(TraceIngestCheckpoint.status != "succeeded").limit(20))] if legacy_enabled() else []
     output = {"view": view, "include": include, "batch_options": options,
               "permissions": permissions(user), "warnings": warnings}
     bid = params.get("batch_id")
@@ -304,7 +308,7 @@ def workspace(db, params, view, user):
     langs = db.execute(select(TraceSample.language, func.count()).where(TraceSample.snapshot_id == scope["snapshot_id"])
                       .group_by(TraceSample.language)).all()
     return {**output, "scope": {**scope, "permissions_version": "platform-v1", "schema_version": "1", "policy_version": scope["projection_version"]},
-        "batch_summary": {"sample_count": count, "by_language": [{"code": l, "label": l, "count": c} for l, c in langs]},
+        "active_snapshot_id": target.active_snapshot_id, "batch_summary": {"sample_count": count, "by_language": [{"code": l, "label": l, "count": c} for l, c in langs]},
         "sample_page": sp, "list_context": sp["context"], "selected_trace_id": selection or (sp["items"][0]["trace_id"] if sp["items"] else None),
         "queried_at": now_shanghai().isoformat() + "+08:00"}
 
@@ -386,7 +390,7 @@ def tool_detail(db, batch, scope, trace, params, user):
     if section == "sequence":
         return {**common, "sequence": sequence}
     counts = {s: sum(c["execution_status"] == s for c in calls) for s in ("succeeded", "failed", "not_executed", "unknown")}
-    return {**common, "summary": {"batch_display_id": batch.display_id, "trace_display_id": sample.display_id,
+    return {**common, "summary": {"batch_display_id": batch.display_id, "batch_name": batch.payload.get("name"), "trace_display_id": sample.display_id,
             "language": sample.language, "test_category": sample.payload.get("test_category"),
             "risk_level": sample.payload.get("risk_level", "unknown"), "event_count": sample.payload["event_count"],
             "source": sample.payload["source"]},
@@ -395,6 +399,7 @@ def tool_detail(db, batch, scope, trace, params, user):
             "not_executed_count": counts["not_executed"], "unknown_status_count": counts["unknown"],
             "overreach_count": sum(any(t["code"] == "overreach" for t in c["behavior_tags"]) for c in calls),
             "inefficient_count": sum(any(t["code"] == "inefficient" for t in c["behavior_tags"]) for c in calls)},
+        "rule_findings": redact(sample.payload.get("rule_findings", []), preserve_ids=True), "rule_audit": sample.payload.get("rule_audit"),
         "timing": timing(sample.payload, calls), "sequence": sequence, "calls": calls_page, "selection": selected,
         "sample_analysis": {"inefficiency_groups": sample.payload.get("inefficiency_groups", [])},
         "permissions": permissions(user), "data_origin": sample.payload["data_origin"],
@@ -445,7 +450,7 @@ def execution_detail(db, scope, trace, params, user):
             text.update(highlights=[],content_version=content_version,permissions_version="platform-v1")
             text["next_cursor"]=cursor(scope,trace,"selection:"+event["event_id"]+":"+content_version+":"+field,text["loaded_units"],user) if text["truncated"] else None
             texts[field]=text
-        texts["reasoning_summary"]["provenance"]="derived_summary"
+        texts["reasoning_summary"]["provenance"]=event.get("reasoning_provenance", "derived_summary")
         references=event.get("source_ref") or {}
         lineage_nodes=[]
         if references.get("source_id"):
@@ -499,7 +504,9 @@ def execution_detail(db, scope, trace, params, user):
         "event_display_id": next(x["display_id"] for x in events if x["event_id"] == e["event_id"]),
         "snippet": e["match_pattern"], "evidence_id": e["evidence_id"]} for e in evidence]
     return {**common, "summary": sample_summary(sample), "graph": graph, "events": sp, "selection": selected,
-        "risk_distribution": {"items": [{"code": "simulated_overreach", "label": "模拟越权", "event_count": len({e['event_id'] for e in evidence})}] if evidence else [],
+        "risk_distribution": {"items": [{"code": code, "label": next(e["risk_type"]["label"] for e in evidence if e["risk_type"]["code"] == code),
+            "event_count": len({e["event_id"] for e in evidence if e["risk_type"]["code"] == code})} for code in sorted({e["risk_type"]["code"] for e in evidence})],
                               "availability": "partial" if evidence else "unavailable"},
         "danger_patterns": page(patterns, number(params, "pattern_page", 1, 2_147_483_647), 20),
+        "rule_findings": redact(sample.payload.get("rule_findings", []), preserve_ids=True), "rule_audit": sample.payload.get("rule_audit"),
         "permissions": permissions(user), "data_origin": sample.payload["data_origin"]}

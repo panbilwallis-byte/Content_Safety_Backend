@@ -46,8 +46,7 @@ def upload(pages,text,name="test.jsonl",key=None):
 
 OPENAI={"messages":[{"role":"user","content":"Keep User_ID unchanged"},{"role":"assistant","tool_calls":[{"id":"src_1","function":{"name":"web.search","arguments":'{"User_ID":42,"tool_call_id":"unchanged"}'}}]},
                     {"role":"tool","tool_call_id":"src_1","content":"public result"}]}
-ANTHROPIC={"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"web.search","input":{"User_ID":42}}]},
-                         {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"public result"}]}]}
+from app.services.agent_trace_trajectory import EXAMPLE as TRAJECTORY
 LANGCHAIN={"runs":[{"id":"root_1","parent_run_id":None,"run_type":"chain","inputs":{"q":"one"},"outputs":{"answer":"one"}},
                     {"id":"tool","parent_run_id":"root_1","run_type":"tool","name":"web.search","inputs":{"q":"one"},"outputs":{"text":"one"}},
                     {"id":"root_2","parent_run_id":None,"run_type":"chain","inputs":{"q":"two"},"outputs":{"answer":"two"}}]}
@@ -80,7 +79,7 @@ def test_statistics_failure_does_not_relabel_published_ingest(pages, monkeypatch
     assert workspace.json()["data"]["summary"]["parsed_trace_count"] == 1
 
 
-@pytest.mark.parametrize("record,fmt,total",[(OPENAI,"openai_messages",1),(ANTHROPIC,"anthropic_messages",1),(LANGCHAIN,"langchain_trace",2)])
+@pytest.mark.parametrize("record,fmt,total",[(OPENAI,"openai_messages",1),(TRAJECTORY,"agent_trajectory",1),(LANGCHAIN,"langchain_trace",2)])
 def test_real_adapter_and_four_view_identity(pages,record,fmt,total):
     batch=create(pages);fid=upload(pages,json.dumps(record,ensure_ascii=False))
     task=parse(pages,batch,[fid])
@@ -94,7 +93,7 @@ def test_real_adapter_and_four_view_identity(pages,record,fmt,total):
     d=pages["client"].get(f"{ROOT}/batches/{batch['batch_id']}/samples/{trace}",params={**scope,"event_types":"tool_call,tool_result"})
     assert d.status_code==200,d.text
     detail=d.json()["data"]
-    if detail["events"]["total"] and fmt!="langchain_trace":
+    if detail["events"]["total"] and fmt=="openai_messages":
         assert "User_ID" in (detail["normalized_event"].get("input_json") or "User_ID")
     assert detail["source_id"]==fid
     # All projections share the same sample identity, while statistics has its own version.
