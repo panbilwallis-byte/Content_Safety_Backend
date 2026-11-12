@@ -111,6 +111,152 @@ LLM_ACCESS_TOKEN=填写模型服务签发的有效令牌
 
 平台登录令牌与 `LLM_ACCESS_TOKEN` 用途不同。模型服务未运行或授权配置不正确时，相关真实调用功能不可用。智能体轨迹来源、独立来源库等配置见 [工具交互接入说明](docs/agent-trace-tools.md) 和 [三页接入说明](docs/agent-trace-pages.md)。
 
+## 将 SQL 备份恢复到新的 MySQL 容器
+
+以下步骤将已有 SQL 导入一个独立的 MySQL 容器，后端继续在宿主机运行。SQL 文件是数据库备份，不需要构建成镜像；数据库数据通过 Docker 命名卷持久化。
+
+本次备份为 `db/backups/content_safety_20261112_150707.sql`，约 406 MiB，源版本为 MySQL `8.0.46`，包含 `content_safety` 库的 74 张表。备份包含 `CREATE DATABASE`、`USE content_safety` 和 `DROP TABLE IF EXISTS`，**只能在确认目标的情况下导入；导入已有同名库会替换其中备份涉及的表。** 下面使用新的容器、数据卷和 `3308` 端口，与当前占用 `3307` 的 `content-safety-dev-mysql-1` 分开。
+
+### 1. 准备 Docker 和备份文件
+
+启动 Docker Desktop（Linux 使用 Docker Engine），确认已安装 Compose 插件。在后端根目录执行：
+
+```powershell
+docker version
+docker compose version
+Get-FileHash ./db/backups/content_safety_20261112_150707.sql -Algorithm SHA256
+New-Item -ItemType Directory -Force ./db/backups/mysql-restore
+```
+
+本次备份 SHA-256 应为：
+
+```text
+bcd90dce3bb834d80e58b12fc63ae0097d32a55f60d71a0cd61e2d4e4c0b2b66
+```
+
+迁移到另一台机器时复制 SQL 文件，并保持后续命令中的路径正确。Linux 可用 `sha256sum` 校验、`mkdir -p ./db/backups/mysql-restore` 创建目录。备份文件和以下部署配置位于已被 Git 忽略的 `db/backups/` 下。
+
+### 2. 创建 Compose 配置和容器初始化密码
+
+在 `db/backups/mysql-restore/compose.yml` 新建以下内容：
+
+```yaml
+services:
+  mysql:
+    image: mysql:8.0.46
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${RESTORE_ROOT_PASSWORD:?请设置root密码}
+      MYSQL_DATABASE: content_safety
+      MYSQL_USER: content_user
+      MYSQL_PASSWORD: ${RESTORE_APP_PASSWORD:?请设置业务账号密码}
+    ports:
+      - "127.0.0.1:3308:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      - --max-allowed-packet=256M
+
+volumes:
+  mysql_data:
+```
+
+在同一目录新建 `.env`，两个密码分别替换为自己的值。使用单引号可避免密码中的 `$` 被 Compose 插值：
+
+```dotenv
+RESTORE_ROOT_PASSWORD='替换为新的root密码'
+RESTORE_APP_PASSWORD='替换为新的content_user密码'
+```
+
+这是 **Compose 初始化配置**，与后端根目录的 `.env` 是两个文件。原 SQL 只备份了业务库，不包含 MySQL 系统账号；新容器的账号密码以此处初始化配置为准，平台 `system_users` 表中的登录账号及密码哈希则随 SQL 恢复。
+
+### 3. 启动新容器并等待 MySQL 就绪
+
+仍在后端根目录执行，固定项目名 `content-safety-restore`：
+
+```powershell
+docker compose --env-file ./db/backups/mysql-restore/.env -f ./db/backups/mysql-restore/compose.yml -p content-safety-restore up -d
+docker compose --env-file ./db/backups/mysql-restore/.env -f ./db/backups/mysql-restore/compose.yml -p content-safety-restore logs --tail 80 mysql
+```
+
+等待日志出现最终的 `ready for connections`，并确认服务已监听 `3306`。如果 `3308` 被其他进程占用，修改 Compose 的宿主机端口，并同步修改后端的 `MYSQL_PORT`。
+
+### 4. 复制 SQL 并手动导入
+
+先把备份复制到新容器：
+
+```powershell
+docker compose --env-file ./db/backups/mysql-restore/.env -f ./db/backups/mysql-restore/compose.yml -p content-safety-restore cp ./db/backups/content_safety_20261112_150707.sql mysql:/tmp/content_safety.sql
+docker compose --env-file ./db/backups/mysql-restore/.env -f ./db/backups/mysql-restore/compose.yml -p content-safety-restore exec mysql mysql --default-character-set=utf8mb4 --max-allowed-packet=256M -u root -p
+```
+
+提示 `Enter password:` 时输入刚设置的 `RESTORE_ROOT_PASSWORD`。进入 `mysql>` 后执行（不要输入提示符本身）：
+
+```sql
+SOURCE /tmp/content_safety.sql;
+SELECT COUNT(*) AS table_count
+FROM information_schema.tables
+WHERE table_schema = 'content_safety' AND table_type = 'BASE TABLE';
+USE content_safety;
+SELECT COUNT(*) AS dataset_count FROM datasets;
+SELECT COUNT(*) AS model_count FROM models;
+SELECT COUNT(*) AS user_count FROM system_users;
+EXIT;
+```
+
+等待整份文件导入完毕，检查过程中是否有 `ERROR`，不要仅凭最后一条查询成功判断导入完整。此次备份恢复后应有 74 张基础表；表数量仅是基础检查，还应核对关键记录和页面。密码交互输入，不要把真实密码写进 README 或命令参数。采用容器内 `SOURCE`，避免 PowerShell 文本管道处理大型 SQL 时改变编码。
+
+命名卷会保留导入的数据；普通重启和 `docker compose ... down` 不会删除该卷。不要使用 `down -v`，除非明确要删除该恢复实例的数据。初始化环境变量只对空数据卷生效；修改 Compose `.env` 不会自动修改已有账号密码，应先在 MySQL 中执行相应 `ALTER USER`，再更新连接配置。
+
+### 5. 修改后端数据库连接
+
+编辑 **后端根目录** 的 `.env`（不是上面的 Compose `.env`）：
+
+```dotenv
+MYSQL_HOST=127.0.0.1
+MYSQL_PORT=3308
+MYSQL_USER=content_user
+MYSQL_PASSWORD=填写与RESTORE_APP_PASSWORD相同的实际密码
+MYSQL_DATABASE=content_safety
+```
+
+切换前停止正在运行的后端，再按以下顺序操作：
+
+1. 从根目录 `.env` 移除或注释 `SSH_HOST`，本机容器直连不需要 SSH；如果系统环境也设置了该变量，需要同步移除。
+2. 检查启动终端或服务管理器是否还设置了旧 `MYSQL_*` 系统环境变量，它们会优先于 `.env`。仅修改文件而不重启进程不会切换现有连接池。
+3. 可先用容器内客户端验证业务账号密码和授权：执行下面的登录命令，输入 `RESTORE_APP_PASSWORD`，然后执行 `SELECT DATABASE(); SHOW TABLES; EXIT;`。
+4. 确认恢复完成后再启动后端；后端启动会继续执行前文说明的迁移、演示数据和回填逻辑，可能改变已恢复的数据。
+
+```powershell
+docker compose --env-file ./db/backups/mysql-restore/.env -f ./db/backups/mysql-restore/compose.yml -p content-safety-restore exec mysql mysql -h 127.0.0.1 -u content_user -p content_safety
+```
+
+退出 MySQL 客户端后重启后端并检查健康接口和业务数据：
+
+```powershell
+uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+在另一终端执行：
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/health
+```
+
+### 6. 不同部署位置的连接地址
+
+| 后端所在位置 | MYSQL_HOST | MYSQL_PORT | 说明 |
+| --- | --- | --- | --- |
+| 与 Docker 同一台宿主机 | `127.0.0.1` | `3308` | 使用宿主机映射端口，本节默认方案。 |
+| 与 MySQL 同一 Compose 网络的容器 | `mysql` | `3306` | 使用服务名和容器内端口；后端容器中的 `127.0.0.1` 指向后端自己。单独启动的容器须先加入同一网络。 |
+| 本机后端通过 SSH 连接远程 Docker 宿主机 | `127.0.0.1` | `3308` | 配置远程宿主机的 `SSH_HOST` 等参数；MYSQL 地址从远程 SSH 主机视角填写。 |
+
+默认端口只绑定宿主机回环地址，其他机器不能直接访问。远程部署建议通过本 README 的 SSH 隧道方式访问；若采用远程直连，需另外配置端口绑定、网络访问规则和匹配的数据库账号授权。
+
+若模型服务也要读取恢复后的共享数据库，需要按该服务实际配置同步切换；不能只切换业务后端而让模型服务继续读取旧库。SQL 不包含宿主机上的 `storage/`、模型文件或训练产物，这些文件需要另外迁移。
+
 ## Linux 服务器后台启动与重启
 
 首次部署仍需先完成依赖安装、建库和 `.env` 配置。在后端根目录执行：

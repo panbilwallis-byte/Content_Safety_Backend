@@ -185,7 +185,9 @@ class TraceSynchronizer:
                               "model_version": row["model_version"]}, samples)
 
     def tick(self):
-        for system, sync in (("business", self.sync_local), ("llm", self.sync_llm)):
+        from app.services.agent_trace_sources import legacy_enabled
+        sources = (("business", self.sync_local), ("llm", self.sync_llm)) if legacy_enabled() else ()
+        for system, sync in sources:
             try:
                 sync()
                 self.record("system:" + system, "succeeded", "来源检查完成")
@@ -195,6 +197,10 @@ class TraceSynchronizer:
                 # Do not print SQL parameters, connection credentials or source texts.
                 self.record("system:" + system, "unavailable", "来源读取失败，请检查数据库连接、表结构与权限")
                 log.warning("Agent trace %s source unavailable", system)
+        from app.services.agent_trace_rules import upgrade_one
+        with self.sessions() as db:
+            if not self.stop_event.is_set() and upgrade_one(db):
+                db.commit()
         from app.services.agent_trace_statistics import materialize
         while not self.stop_event.is_set():
             with self.sessions() as db:

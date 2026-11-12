@@ -18,14 +18,16 @@ from app.models.agent_traces import (TraceAsset, TraceBinding, TraceBatch, Trace
 from app.services.agent_trace_generation import VERSION, stable_id, generated_sample, validate_process, dumps
 from app.services import agent_trace_query as q
 
+from app.services.agent_trace_trajectory import EXAMPLE as TRAJECTORY_EXAMPLE, normalize_trajectory
+
 MAX_BYTES = 10 * 1024 * 1024
 FORMATS = [
     {"code":"openai_messages","label":"OpenAI Messages","containers":["json","jsonl"],"description":"完整 messages 轨迹，支持工具调用和返回", "availability":"available","schema_version":"1",
      "example_text":dumps({"messages":[{"role":"user","content":"Summarize a public report"},{"role":"assistant","tool_calls":[{"id":"call_1","function":{"name":"search","arguments":'{"q":"public report"}'}}]},{"role":"tool","tool_call_id":"call_1","content":"Public result"}]})},
     {"code":"langchain_trace","label":"LangChain / LangSmith Trace","containers":["json","jsonl"],"description":"平台 runs 包装，按根运行分组", "availability":"available","schema_version":"1",
      "example_text":dumps({"runs":[{"id":"root","parent_run_id":None,"run_type":"chain","inputs":{"q":"report"},"outputs":{"answer":"summary"}},{"id":"tool","parent_run_id":"root","run_type":"tool","name":"search","inputs":{"q":"report"},"outputs":{"text":"result"}}]})},
-    {"code":"anthropic_messages","label":"Anthropic Messages","containers":["json","jsonl"],"description":"Messages content block 中的 tool_use / tool_result", "availability":"available","schema_version":"1",
-     "example_text":dumps({"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"search","input":{"q":"report"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"result"}]}]})},
+    {"code":"agent_trajectory","label":"智能体轨迹 JSONL","containers":["json","jsonl"],"description":"外部智能体 events / tool_events 轨迹（含推理、工具及 Token）", "availability":"available","schema_version":"1",
+     "example_text":dumps(TRAJECTORY_EXAMPLE)},
 ]
 
 
@@ -166,11 +168,16 @@ def records(text,extension):
 
 def normalize(record,file_id,index,raw,line,override):
     if not isinstance(record,dict):raise ValueError("轨迹必须为对象")
+    if isinstance(record.get("events"),list) and record.get("sample_id"):
+        if override not in {"auto","agent_trajectory"}:raise ValueError("格式覆盖与核心结构不一致")
+        return normalize_trajectory(record,file_id,index,raw,line,normalize)
+    if override=="agent_trajectory":raise ValueError("智能体轨迹缺少 sample_id 或 events")
     messages=record.get("messages")
     detected="langchain_trace" if isinstance(record.get("runs"),list) else None
     if isinstance(messages,list):
         blocks=[b for m in messages if isinstance(m,dict) for b in (m.get("content") if isinstance(m.get("content"),list) else []) if isinstance(b,dict)]
-        detected="anthropic_messages" if any(b.get("type") in {"tool_use","tool_result"} for b in blocks) else "openai_messages"
+        if any(b.get("type") in {"tool_use","tool_result"} for b in blocks):raise ValueError("不再支持 Anthropic 格式，请选择支持的轨迹格式")
+        detected="openai_messages"
     fmt=detected if override=="auto" else override
     if not fmt or (fmt=="langchain_trace" and not isinstance(record.get("runs"),list)) or (fmt!="langchain_trace" and not isinstance(messages,list)):
         raise ValueError("无法识别或格式覆盖与记录结构不匹配")
@@ -198,7 +205,15 @@ def normalize(record,file_id,index,raw,line,override):
         e=event("tool_result","tool",output,path)
         c=pending.pop(source_id,None)
         if not c:issues.append("call_unlinked");return
-        c.update(return_event_id=e["event_id"],output_json=output if isinstance(output,str) else dumps(output),output_summary=str(output)[:512],execution_status="failed" if error else "succeeded",result_code="ERROR" if error else "OK")
+        try:
+            body = json.loads(output) if isinstance(output, str) else output
+        except (ValueError, TypeError):
+            body = {}
+        body = body if isinstance(body, dict) else {}
+        status = "failed" if error else {"success":"succeeded", "succeeded":"succeeded", "blocked":"not_executed", "error":"failed", "failed":"failed"}.get(body.get("status"), "unknown")
+        c.update(return_event_id=e["event_id"],output_json=output if isinstance(output,str) else dumps(output),output_summary=str(output)[:512],
+            execution_status=status,result_code=body.get("error_code") or ("ERROR" if error else "OK" if status=="succeeded" else "NOT_RECORDED"),
+            permission_decision="denied" if status=="not_executed" else "unknown")
         e["call_id"]=c["call_id"];c["evidence_chain"].append({"event_id":e["event_id"],"display_id":e["display_id"]})
     if fmt=="langchain_trace":
         runs=record["runs"]
@@ -212,14 +227,8 @@ def normalize(record,file_id,index,raw,line,override):
         for j,m in enumerate(messages):
             if not isinstance(m,dict) or not isinstance(m.get("role"),str):raise ValueError("消息角色缺失")
             content=m.get("content")
-            if fmt=="anthropic_messages" and isinstance(content,list):
-                for k,b in enumerate(content):
-                    if not isinstance(b,dict):raise ValueError("content block无效")
-                    path=f"messages[{j}].content[{k}]"
-                    if b.get("type")=="tool_use":call(b.get("id"),b.get("name"),dumps(b.get("input")),path)
-                    elif b.get("type")=="tool_result":result(b.get("tool_use_id"),dumps(b.get("content")),path,bool(b.get("is_error")))
-                    else:event("message",m["role"],str(b.get("text","")),path)
-            elif m["role"]=="tool":result(m.get("tool_call_id"),content if isinstance(content,str) else dumps(content),f"messages[{j}]")
+            before = len(events)
+            if m["role"]=="tool":result(m.get("tool_call_id"),content if isinstance(content,str) else dumps(content),f"messages[{j}]")
             else:
                 if content is not None:event("message",m["role"],content if isinstance(content,str) else dumps(content),f"messages[{j}].content")
                 for k,c in enumerate(m.get("tool_calls",[])):
@@ -227,6 +236,13 @@ def normalize(record,file_id,index,raw,line,override):
                     try:json.loads(args) if isinstance(args,str) else None
                     except ValueError:issues.append("structure_invalid")
                     call(c.get("id"),fn.get("name"),args,f"messages[{j}].tool_calls[{k}]")
+            for emitted in events[before:]:
+                reasoning = m.get("reasoning_content") or m.get("reasoning")
+                if isinstance(reasoning, str) and reasoning:
+                    emitted.update(reasoning_summary=reasoning, reasoning_provenance="source_log")
+                timestamp = m.get("ts_ms")
+                if type(timestamp) in {int, float} and timestamp >= 0:
+                    emitted["relative_time_ms"] = timestamp
     if pending:issues.append("call_unlinked")
     metadata=record.get("metadata") if isinstance(record.get("metadata"),dict) else {}
     duration=record.get("duration_ms",metadata.get("duration_ms"))
@@ -247,6 +263,8 @@ def normalize(record,file_id,index,raw,line,override):
         "test_category":record.get("test_category") or metadata.get("test_category"),"inefficiency_groups":[],"data_origin":"actual"}
     language=record.get("language",metadata.get("language","unknown"))
     language=language if language in {"zh","en","other","unknown"} else "other"
+    from app.services.agent_trace_audit import recorded_audit
+    recorded_audit(record, execution, events, calls)
     return {"id":f"{file_id}:{index}","text":raw,"language":language,"execution":execution,"source_record":record}
 
 
@@ -295,11 +313,13 @@ def submit(db,body,user,key,name):
 
 def publish(db,batch,tid,parsed,selected_ids):
     from app.services.agent_trace_statistics import VERSION as STATS_VERSION
+    from app.services.agent_trace_rules import VERSION as RULE_VERSION, audit_process
+    from app.services.agent_trace_audit import recorded_audit
     sid=stable_id("snap_",batch.batch_id,tid)
     old=batch.active_snapshot_id
     carried=list(db.scalars(select(TraceSample).where(TraceSample.snapshot_id==old))) if old else []
     carried=[s for s in carried if s.payload["source"]["source_id"] not in selected_ids]
-    db.add(TraceSnapshot(snapshot_id=sid,batch_id=batch.batch_id,payload={"schema_version":"1","batch_version_at_start":batch.payload["batch_version"],"sample_count":len(carried)+len(parsed),"data_origin":"actual"}))
+    db.add(TraceSnapshot(snapshot_id=sid,batch_id=batch.batch_id,payload={"schema_version":"1","batch_version_at_start":batch.payload["batch_version"],"sample_count":len(carried)+len(parsed),"data_origin":"actual","rule_version":RULE_VERSION}))
     for version in (VERSION,STATS_VERSION):db.add(TraceProjection(projection_id=stable_id("proj_",sid,version),snapshot_id=sid,version=version,payload={"policy_version":version,"data_origin":"actual"}))
     for oldrow in carried:
         db.add(TraceSample(id=stable_id("sample_",sid,oldrow.trace_id),snapshot_id=sid,trace_id=oldrow.trace_id,sample_id=oldrow.sample_id,display_id=oldrow.display_id,
@@ -311,13 +331,46 @@ def publish(db,batch,tid,parsed,selected_ids):
                 if model==TraceCall:args.update(call_id=row.call_id,ordinal=row.ordinal)
                 if model==TraceEvidence:args.update(event_id=row.event_id,projection_version=row.projection_version)
                 db.add(model(**args))
+    db.flush()
+    # A partial reparse can carry older samples. Audit them in this new snapshot too.
+    for carried_row in carried:
+        if carried_row.payload.get("rule_audit", {}).get("version") == RULE_VERSION:
+            continue
+        execution = deepcopy(carried_row.payload)
+        prior_scope = {"snapshot_id": old}
+        execution["events"] = q.process_records(db, prior_scope, carried_row.trace_id, TraceEvent)
+        execution["calls"] = q.process_records(db, prior_scope, carried_row.trace_id, TraceCall)
+        for event in execution["events"]:
+            event["risk_level"] = "unknown"
+        source_evidence = recorded_audit(carried_row.result.get("source_record", {}), execution, execution["events"], execution["calls"])
+        audit_rows = audit_process(execution, execution["events"], execution["calls"], source_evidence)
+        current = db.scalar(select(TraceSample).where(TraceSample.snapshot_id==sid, TraceSample.trace_id==carried_row.trace_id))
+        current.payload = {k:v for k,v in execution.items() if k not in {"events","calls"}}
+        for model, field, identity in ((TraceEvent,"events","event_id"),(TraceCall,"calls","call_id")):
+            values = {e[identity]:e for e in execution[field]}
+            for row in db.scalars(select(model).where(model.snapshot_id==sid,model.trace_id==carried_row.trace_id)):
+                row.payload = values[getattr(row,identity)]
+        for row in list(db.scalars(select(TraceEvidence).where(TraceEvidence.snapshot_id==sid,TraceEvidence.trace_id==carried_row.trace_id))):
+            db.delete(row)
+        db.flush()
+        for evidence in audit_rows:
+            db.add(TraceEvidence(id=stable_id("row_",sid,carried_row.trace_id,evidence["evidence_id"]), snapshot_id=sid,
+                trace_id=carried_row.trace_id,event_id=evidence["event_id"],projection_version=VERSION,payload=evidence))
     start=max((s.ingest_order for s in carried),default=-1)+1
     for n,sample in enumerate(parsed,start):
         trace,p,events,calls,relations=generated_sample("upload",sample,n)
         # Stable IDs are asset/record based, independent of task and batch membership.
+        from app.services.agent_trace_audit import recorded_audit
+        for e in events:
+            e["risk_level"] = "unknown"
+        audit_rows = recorded_audit(sample.get("source_record", {}), p, events, calls)
+        audit_rows = audit_process(p, events, calls, audit_rows)
         validate_process(p,events,calls)
-        db.add(TraceSample(id=stable_id("sample_",sid,trace),snapshot_id=sid,trace_id=trace,sample_id=sample["id"],display_id=f"AUD-{n+1:04}",
+        db.add(TraceSample(id=stable_id("sample_",sid,trace),snapshot_id=sid,trace_id=trace,sample_id=str(p.get("original_sample_id") or sample["id"]),display_id=(str(p["original_sample_id"]) if p.get("original_sample_id") and len(str(p["original_sample_id"]))<=64 else f"AUD-{n+1:04}"),
             ingest_order=n,language=sample["language"],result={k:v for k,v in sample.items() if k!="execution"},payload=p))
+        for evidence in audit_rows:
+            db.add(TraceEvidence(id=stable_id("row_",sid,trace,evidence["evidence_id"]), snapshot_id=sid,
+                trace_id=trace, event_id=evidence["event_id"], projection_version=VERSION, payload=evidence))
         for e in events:db.add(TraceEvent(id=stable_id("row_",sid,trace,e["event_id"]),snapshot_id=sid,trace_id=trace,event_id=e["event_id"],ordinal=e["ordinal"],payload=e))
         for c in calls:db.add(TraceCall(id=stable_id("row_",sid,trace,c["call_id"]),snapshot_id=sid,trace_id=trace,call_id=c["call_id"],ordinal=c["order"],payload=c))
         for rel in relations:db.add(TraceRelation(id=stable_id("row_",sid,trace,rel["edge_id"]),snapshot_id=sid,trace_id=trace,payload=rel))
@@ -413,7 +466,7 @@ def detail(db,scope,trace,params,user):
     if params.get("source_id") and params["source_id"]!=p["source"]["source_id"]:q.fail(409,"样本来源不匹配")
     all_events=q.process_records(db,scope,trace,TraceEvent)
     types=set(params.get("event_types","").split(','))-{''}
-    if types-{"message","run","recorded_step","value_result","tool_call","tool_result","policy_decision"}:q.fail(422,"事件类型无效")
+    if types-{"message","run","recorded_step","value_result","tool_call","tool_result","policy_decision","user","thought","final","error","system"}:q.fail(422,"事件类型无效")
     events=[e for e in all_events if not types or e["event_type"] in types]
     eid=params.get("event_id")
     if eid and not any(e["event_id"]==eid for e in all_events):q.fail(404,"事件不存在")
@@ -438,6 +491,7 @@ def detail(db,scope,trace,params,user):
     normalized=next((e for e in rendered if chosen and e["event_id"]==chosen["event_id"]),None)
     return {**sample_item(row),**scope,"selected_event_id":chosen["event_id"] if chosen else None,"selected_event_page":events.index(chosen)//size+1 if chosen else None,
         "events":q.page(q.redact(rendered,preserve_ids=True),num,size),"normalized_event":q.redact(normalized,preserve_ids=True),
+        "event_options":q.redact([{k:e.get(k) for k in ("event_id","ordinal","event_type","label","tool_name")} for e in rendered],preserve_ids=True),
         "raw_preview":{"raw_text":preview["text"],"kind":"full" if not preview["truncated"] else "fragment","truncated":preview["truncated"],"line_start":1,"total_lines":raw.count('\n')+1},
         "source_ref":chosen.get("source_ref") if chosen and chosen.get("source_ref") else {"source_path":"$","record_index":row.ingest_order+1},
         "mapping":{"format_label":p["source"]["format_label"],"rows":[{"source_path":(chosen.get("source_ref",{}).get("source_path","$") if chosen else "$"),"target_path":"event","description":"源日志到规范事件","state":"mapped" if p.get("data_origin")=="actual" else "generated"}]},
@@ -473,6 +527,8 @@ def workspace(db,params,user):
         return output
     _,scope=q.resolve(db,bid,params)
     all_rows=list(db.scalars(select(TraceSample).where(TraceSample.snapshot_id==sid).order_by(TraceSample.ingest_order,TraceSample.trace_id)))
+    from app.services.agent_trace_rules import audit_summary
+    output["audit_summary"] = audit_summary([r.payload for r in all_rows])
     sources={r.payload["source"]["source_id"]:r.payload["source"] for r in all_rows}
     options_source=[{"source_id":i,"filename":v.get("filename","价值分析记录")} for i,v in sources.items()]
     oq=params.get("option_q","").casefold()
@@ -483,7 +539,9 @@ def workspace(db,params,user):
             "parsed_trace_count":sum(r.payload["source"]["source_id"]==i for r in all_rows),"input_candidate_count":None,"failed_record_count":0,"error_examples":[]} for i,v in sources.items()]
     output["files"]=q.page(file_rows,q.number(params,"files_page",1,2147483647),20)
     source=params.get("source_id")
-    if not source and not params.get("issue_type"):source=next(iter(sources),None)
+    if not source and not params.get("issue_type"):
+        selected_trace = next((r for r in all_rows if r.trace_id == params.get("trace_id")), None)
+        source = selected_trace.payload["source"]["source_id"] if selected_trace else next(iter(sources),None)
     selection_params={**params,"source_id":source}
     selected=selected_rows(db,scope,selection_params)
     target=params.get("trace_id")

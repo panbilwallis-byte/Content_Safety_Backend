@@ -33,6 +33,8 @@ ROOT = "/api/v1/compliance/agent-traces"
 
 @pytest.fixture
 def env(monkeypatch, tmp_path):
+    # These legacy regressions explicitly opt into historical simulated value fixtures.
+    monkeypatch.setenv("AGENT_TRACE_ENABLE_LEGACY_VALUE_SYNC", "true")
     engine = create_engine("sqlite+pysqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     Base.metadata.create_all(engine)
     sessions = sessionmaker(bind=engine, expire_on_commit=False)

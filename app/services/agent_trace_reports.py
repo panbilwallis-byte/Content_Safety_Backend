@@ -108,7 +108,7 @@ def build(db,task):
               "requested_scope":data["scope"],"notice":"含模拟过程或默认展示数据时，不作为真实审计结论"}
     for row in rows:
         value=stats.normalized(db,scope,row)
-        document["samples"].append({**value,"summary":q.sample_summary(row),"data_origin":row.payload.get("data_origin","actual")})
+        document["samples"].append({**value,"summary":q.sample_summary(row),"data_origin":row.payload.get("data_origin","actual"), "rule_audit":row.payload.get("rule_audit"), "rule_findings":row.payload.get("rule_findings",[])})
     if data["view"]=="statistics":document["statistics"]=stats.aggregate(db,scope,{"language":data["scope"].get("language",data.get("language","all"))},{"uid":task.config["owner_id"]})
     document["errors"]=[b.payload.get("error_examples",[]) for b in db.scalars(select(TraceBinding).where(TraceBinding.batch_id==scope["batch_id"]))]
     if rows:document=anonymize(document,task.task_id,rows[0])
@@ -125,7 +125,7 @@ def build(db,task):
             writer.writerow(["'"+v if isinstance(v,str) and v[:1] in {'=','+','-','@'} else v for v in row])
         files["samples.csv"]=output.getvalue().encode("utf-8-sig")
     if "evidence_index" in contents:
-        files["evidence-index.json"]=dumps([{ "trace_id":s["trace_id"],"calls":[{"call_id":c["call_id"],"event_id":c["event_id"],"evidence_chain":c["evidence_chain"]} for c in s["calls"]]} for s in document["samples"]]).encode()
+        files["evidence-index.json"]=dumps([{ "trace_id":s["trace_id"],"rule_findings":s.get("rule_findings",[]), "calls":[{"call_id":c["call_id"],"event_id":c["event_id"],"evidence_chain":c["evidence_chain"]} for c in s["calls"]]} for s in document["samples"]]).encode()
     if "offline_html" in contents:files["report.html"]=("<!doctype html><meta charset='utf-8'><title>轨迹审计报告</title><h1>智能体轨迹审计</h1><p>"+html.escape(document["notice"])+"</p><pre>"+html.escape(json.dumps(document,ensure_ascii=False,indent=2))+"</pre>").encode()
     if "error_report" in contents:files["errors.json"]=dumps(document["errors"]).encode()
     manifest={"schema_version":"1",**document["scope"],"view":data["view"],"sample_count":len(rows),

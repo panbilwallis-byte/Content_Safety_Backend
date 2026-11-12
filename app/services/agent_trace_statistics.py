@@ -12,7 +12,7 @@ from app.services import agent_trace_query as q
 
 VERSION = "statistics_v1"
 CATEGORIES = [("prompt_injection", "提示注入"), ("unauthorized_access", "越权访问"),
-              ("privacy_leak", "隐私泄露"), ("harmful_content", "有害内容"), ("tool_misuse", "工具滥用"), ("other", "其他")]
+              ("privacy_leak", "隐私泄露"), ("harmful_content", "有害内容"), ("tool_misuse", "工具滥用"), ("other", "其他"), ("normal", "正常任务")]
 
 
 def materialize(db):
@@ -46,8 +46,8 @@ def materialize(db):
             "reasoning": "available" if values["reasoning_recorded"] is not None else "not_provided"}
         missing_fields = [k for k, v in availability.items() if v != "available"]
         complete = all(v is not None for v in values.values())
-        values.update(total_recorded=sum(v for v in values.values() if isinstance(v, int)),
-            normalization_policy="mutually_exclusive_v1", availability="available" if complete else "partial")
+        values.update(total_recorded=(sum(v for v in values.values() if isinstance(v, int)) if any(v is not None for v in values.values()) else None),
+            estimated=usage.get("estimated", False), normalization_policy="mutually_exclusive_v1", availability="available" if complete else "partial")
         actual_decision = p.get("audit_decision", "unknown")
         display_decision = actual_decision
         if generated and actual_decision == "unknown":
@@ -56,7 +56,7 @@ def materialize(db):
         db.add(TraceStatisticsSample(id=stable_id("sts_", sample.snapshot_id, sample.trace_id), snapshot_id=sample.snapshot_id,
             trace_id=sample.trace_id, payload={"test_category": category, "token_usage": values,
                 "missing_fields": missing_fields, "availability": availability, "task_status": task_status,
-                "audit_decision": display_decision, "actual_audit_decision": actual_decision,
+                "audit_decision": display_decision, "actual_audit_decision": p.get("source_audit_decision", actual_decision),
                 "data_origin": "mixed" if generated else p.get("data_origin", "actual")}))
     db.flush()
     for sid in snapshots:
@@ -105,7 +105,7 @@ def summary(s, st, scope, user):
         "event_count": p["event_count"], "call_count": p["call_count"], "retry_count": p.get("retry_count", 0),
         "duration_ms": p.get("duration_ms"), "task_status": v["task_status"], "audit_decision": v["audit_decision"],
         "missing_fields": v["missing_fields"], "availability": v["availability"], "ingest_order": s.ingest_order,
-        "data_origin": v["data_origin"], "actual_audit_decision": v["actual_audit_decision"],
+        "data_origin": v["data_origin"], "actual_audit_decision": v["actual_audit_decision"], "rule_audit": p.get("rule_audit"), "rule_findings": q.redact(p.get("rule_findings", []), preserve_ids=True),
         "allowed_actions": {"view_detail": True, "copy_json": True, "export_json": q.permissions(user)["can_export"]}}
 
 
@@ -142,12 +142,14 @@ def aggregate(db, scope, params, user):
     steps = [s.payload["event_count"] for s, _ in data if s.payload.get("event_count") is not None]
     audit_valid=sum(st.payload["audit_decision"] in {"risk_found","no_risk_found"} for _,st in data)
     token_valid=sum(any(st.payload["token_usage"][key] is not None for key in ("input","reasoning_recorded","final_output")) for _,st in data)
+    task_valid = sum(st.payload["task_status"] in {"completed", "failed", "terminated", "cancelled", "blocked"} for _, st in data)
     kpis = {"sample_count": metric(n), "risk_sample_count": metric(risk if audit_valid else None,valid=audit_valid),
         "recorded_tokens": metric(sum(totals.values()) if token_valid else None, "token",token_valid),
         "reasoning_output_ratio": metric(sum(v["reasoning_recorded"] for v in compatible) / denom if denom else None, "ratio", len(compatible)),
         "tool_call_count": metric(len(calls)), "tool_type_count": metric(len({c.get("tool_id", c["tool_name"]) for c in calls})),
         "average_steps": metric(sum(steps) / len(steps) if steps else None, "step", len(steps)),
-        "task_success_rate": metric(100 * sum(st.payload["task_status"] == "completed" for _, st in data) / n if n else None, "percent")}
+        "task_success_rate": metric(100 * sum(st.payload["task_status"] == "completed" for _, st in data) / task_valid if task_valid else None, "percent", task_valid)}
+    kpis["recorded_tokens"]["estimated_sample_count"] = sum(bool(st.payload["token_usage"].get("estimated")) for _, st in data)
     times = sorted(s.payload["duration_ms"] for s, _ in data if isinstance(s.payload.get("duration_ms"), (int, float)) and s.payload["duration_ms"] >= 0)
     limits = [(0,1000), (1000,2000), (2000,4000), (4000,6000), (6000,8000), (8000,10000), (10000,None)]
     durations = {"availability": "available" if times else "unavailable", "valid_count": len(times),
@@ -169,10 +171,23 @@ def aggregate(db, scope, params, user):
     by_category = Counter(st.payload["test_category"] for _, st in data)
     category_for = {s.trace_id: st.payload["test_category"] for s, st in data}
     matrix = Counter()
+    risk_categories = {code for code, _ in CATEGORIES if code != "normal"}
     for c in calls:
-        for code in { {"overreach":"unauthorized","inefficient":"duplicate"}.get(t["code"],t["code"]) for t in c.get("behavior_tags", []) }:
-            matrix[(category_for[c["_trace_id"]], code, c["_trace_id"], c["event_id"])] = 1
-    columns = [("unauthorized","越权"),("argument_error","参数错误"),("timeout","超时"),("duplicate","重复"),("retry","重试")]
+        codes = {{"overreach":"policy_denied","unauthorized":"policy_denied","inefficient":"duplicate"}.get(t["code"],t["code"]) for t in c.get("behavior_tags", [])}
+        if c.get("permission_decision") == "denied" or c.get("result_code") == "POLICY_DENIED" or c.get("execution_status") == "not_executed":
+            codes.add("policy_denied")
+        error_code = str(c.get("result_code") or "").upper()
+        if "TIMEOUT" in error_code or "超时" in error_code:
+            codes.add("timeout")
+        if error_code in {"INVALID_ARGUMENT", "INVALID_ARGUMENTS", "ARGUMENT_ERROR", "VALIDATION_ERROR"}:
+            codes.add("argument_error")
+        for finding in c.get("rule_findings", []):
+            rule = finding.get("rule_id")
+            if rule in {"recorded_duplicate", "repeated_request"}:codes.add("duplicate")
+            if rule == "recorded_retry":codes.add("retry")
+        for code in codes:
+            matrix[(category_for[c["_trace_id"]], code, c["_trace_id"], c["call_id"])] = 1
+    columns = [("policy_denied","调用被拦截"),("argument_error","参数错误"),("timeout","调用超时"),("duplicate","重复请求"),("retry","调用重试")]
     charts = {"test_category_distribution": distribution(by_category),
         "token_composition": {"availability": "available" if n else "not_applicable", "mutually_exclusive": True,
             "normalized_policy": "mutually_exclusive_v1", "compatible_sample_count": len(compatible),
@@ -182,8 +197,8 @@ def aggregate(db, scope, params, user):
         "duration_distribution": durations, "tool_result_distribution": results,
         "behavior_matrix": {"availability": "available" if n else "not_applicable", "row_dimension": "test_category", "unit": "event_occurrence", "overlap_allowed": True,
             "columns": [{"code": c, "label": l} for c,l in columns], "rows": [{"category_code": cat, "label": dict(CATEGORIES).get(cat,cat),
-                "cells": [{"behavior_code": c, "count": sum(v for (ca,co,_,_),v in matrix.items() if ca == cat and co == c)} for c,_ in columns]} for cat in sorted(by_category)]},
-        "source_distribution": distribution(Counter("external_import" if s.payload["source"].get("format_code") != "value_analysis" else "platform" for s,_ in data)),
+                "cells": [{"behavior_code": c, "count": sum(v for (ca,co,_,_),v in matrix.items() if ca == cat and co == c)} for c,_ in columns]} for cat in sorted(by_category) if cat in risk_categories]},
+        "source_distribution": distribution(Counter(s.payload.get("origin_type", "external_import") for s,_ in data)),
         "language_distribution": distribution(Counter(s.language for s,_ in data))}
     completeness = {}
     for field in ("source", "time", "reasoning"):
@@ -193,7 +208,8 @@ def aggregate(db, scope, params, user):
     completeness.update(required_fields=["source","time","reasoning"], missing_union_count=missing,
         overlap_summary={"time_missing_count": completeness["time"]["missing_count"], "reasoning_missing_count": completeness["reasoning"]["missing_count"],
                          "source_missing_count": completeness["source"]["missing_count"], "time_and_reasoning_count": sum({"time","reasoning"} <= set(st.payload["missing_fields"]) for _,st in data)})
-    return {"kpis": kpis, "charts": charts, "completeness": completeness, "list_counts": {"all":n,"risk":risk,"missing_fields":missing}}
+    from app.services.agent_trace_rules import audit_summary
+    return {"audit_summary": audit_summary([s.payload for s, _ in data]), "kpis": kpis, "charts": charts, "completeness": completeness, "list_counts": {"all":n,"risk":risk,"missing_fields":missing}}
 
 
 def workspace(db, params, user):
@@ -232,7 +248,7 @@ def workspace(db, params, user):
             "contents":[{"code":c,"label":c,"availability":"available"} for c in ("statistics_png","stats_summary","sample_table","normalized_json","manifest")],
             "required_contents":["manifest"],"redaction_profiles":["standard"],"default_scope":"filtered","max_selected_trace_ids":100},
         "module_availability":{v:{"availability":"available"} for v in ("ingest","statistics","execution","tools")},
-        "warnings":[{"code":"mixed_display_data","message":"含模拟过程及默认展示指标；并非实际风险检测结论。","panel":"all"}]}
+        "warnings": ([{"code":"mixed_display_data","message":"含模拟过程及默认展示指标；并非实际风险检测结论。","panel":"all"}] if any(s.payload.get("data_origin") != "actual" for s, _ in rows(db, scope, params)) else [])}
 
 
 def normalized(db,scope,sample):
