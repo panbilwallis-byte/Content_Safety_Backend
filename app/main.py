@@ -13,6 +13,8 @@ from app.core.database import (
 from app.models import tables
 from app.models import agent_traces as agent_trace_models
 from app.routers import agent_traces as agent_trace_router
+from app.models import internal_agent as internal_agent_models
+from app.routers import internal_agent as internal_agent_router
 from app.core.audit_logging import protect_download_access_logs
 
 protect_download_access_logs()
@@ -86,6 +88,9 @@ async def lifespan(app: FastAPI):
 
     # 根据 tables.py 中的模型创建表
     Base.metadata.create_all(bind=engine)
+    from app.services.internal_agent import recover as recover_agents
+    with SessionLocal() as db:
+        recover_agents(db)
     from app.services.model_comparison import recover as recover_comparisons
     with SessionLocal() as db:
         recover_comparisons(db)
@@ -328,6 +333,7 @@ app.include_router(
 
 app.include_router(model_comparison_router, prefix="/api/v1", tags=["模型真实对照评估"])
 app.include_router(agent_trace_router.router, prefix="/api/v1", tags=["智能体轨迹工具交互"])
+app.include_router(internal_agent_router.router, prefix="/api/v1", tags=["内部智能体任务"])
 
 @app.get("/health")
 def health():

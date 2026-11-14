@@ -18,7 +18,7 @@ from sqlalchemy.exc import IntegrityError
 from app.core.database import SessionLocal
 from app.core.time import now_shanghai
 from app.models.tables import SystemUser, Task
-from app.models.agent_traces import TraceArtifact, TraceIdempotency
+from app.models.agent_traces import TraceArtifact, TraceIdempotency, TraceBatch
 from app.repositories.task_repository import task_to_dict
 from app.services.agent_trace_generation import dumps
 from app.services import agent_trace_query as query
@@ -101,6 +101,12 @@ def validate_input(db, data, user):
 
 
 def create_task(db, data, user, key, name=None):
+    # Serialize export submission with batch deletion before reading its data.
+    if isinstance(data.get("batch_id"), str):
+        batch = db.scalar(select(TraceBatch).where(TraceBatch.batch_id == data["batch_id"])
+            .with_for_update().execution_options(populate_existing=True))
+        if not batch:
+            fail(404, "批次不存在或已删除")
     frozen = validate_input(db, data, user)  # Authorization is checked on every replay.
     identity = idem_key(user["uid"], "/tasks/execute", key)
     digest = hashlib.sha256(json.dumps({"input": data, "name": name}, sort_keys=True,

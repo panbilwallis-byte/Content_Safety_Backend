@@ -87,6 +87,18 @@ def samples(batch_id: str, request: Request, view: str = Query("ingest"), user=D
     return success(service.samples(db, scope, dict(request.query_params), view))
 
 
+@router.delete(root + "/batches/{batch_id}")
+def delete_batch(batch_id: str, request: Request, body: dict = Body(...), user=Depends(actor), db=Depends(get_db)):
+    from app.services import agent_trace_ingest as ingest
+    return success(ingest.delete_batch(db, user, batch_id, body, request.headers.get("X-Request-Id")))
+
+
+@router.delete(root + "/batches/{batch_id}/files/{file_id}")
+def remove_file(batch_id: str, file_id: str, request: Request, body: dict = Body(...), user=Depends(actor), db=Depends(get_db)):
+    from app.services import agent_trace_ingest as ingest
+    return success(ingest.remove_file(db, user, batch_id, file_id, body, request.headers.get("X-Request-Id")))
+
+
 @router.get(root + "/batches/{batch_id}/samples/{trace_id}")
 def detail(batch_id: str, trace_id: str, request: Request, view: str = Query("ingest"), user=Depends(actor), db=Depends(get_db)):
     view_param(view)

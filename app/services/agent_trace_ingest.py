@@ -7,14 +7,15 @@ import logging
 from pathlib import Path
 from uuid import uuid4
 
-from sqlalchemy import select, update
+from sqlalchemy import select, update, delete
 from sqlalchemy.exc import IntegrityError
 
 from app.core.database import SessionLocal
 from app.core.time import now_shanghai
 from app.models.tables import Task
 from app.models.agent_traces import (TraceAsset, TraceBinding, TraceBatch, TraceSnapshot, TraceProjection,
-    TraceSample, TraceEvent, TraceCall, TraceRelation, TraceEvidence, TraceIdempotency)
+    TraceSample, TraceEvent, TraceCall, TraceRelation, TraceEvidence, TraceIdempotency,
+    TraceArtifact, TraceStatisticsSample)
 from app.services.agent_trace_generation import VERSION, stable_id, generated_sample, validate_process, dumps
 from app.services import agent_trace_query as q
 
@@ -79,7 +80,7 @@ def batch_dict(batch, user):
     actions=["view_raw"] if q.permissions(user)["can_view_raw"] else []
     if q.permissions(user)["can_export"]:
         actions += ["export_view","export_package"]
-        if batch.source_system=="upload": actions += ["upload","bind_files","parse"]
+        if batch.source_system=="upload": actions += ["upload","bind_files","parse","delete_batch","remove_file"]
     return {"batch_id":batch.batch_id,"display_id":batch.display_id,"name":p.get("name","轨迹批次"),
         "batch_version":p.get("batch_version",1),"active_snapshot_id":batch.active_snapshot_id or None,
         "allowed_actions":actions,"staging_changed":p.get("staging_changed",False)}
@@ -108,6 +109,65 @@ def check_edit(db,bid):
 
 def bindings(db,bid):
     return list(db.scalars(select(TraceBinding).where(TraceBinding.batch_id==bid).order_by(TraceBinding.file_id)))
+
+
+def deletion_context(db, bid, expected):
+    if type(expected) is not int:
+        q.fail(422, "请提供批次版本")
+    batch = check_edit(db, bid)
+    if batch.payload.get("batch_version", 1) != expected:
+        q.fail(409, "批次已发生变化，请刷新后重试")
+    running = db.scalar(select(Task.task_id).where(
+        Task.capability_code.in_(["agent_trace_ingest", "agent_trace_export"]),
+        Task.status.in_(["pending", "running"]), Task.input_data["batch_id"].as_string() == bid))
+    if running:
+        q.fail(409, "当前批次有解析或导出任务进行中，请等待完成后再删除")
+    return batch
+
+
+def delete_batch(db, user, bid, body, key):
+    expected = body.get("expected_version")
+    def action():
+        deletion_context(db, bid, expected)
+        if db.scalar(select(TraceBinding.id).where(TraceBinding.batch_id == bid).limit(1)):
+            q.fail(409, "批次中还有文件，请先删除文件后再删除空批次")
+        snapshots = select(TraceSnapshot.snapshot_id).where(TraceSnapshot.batch_id == bid)
+        for model in (TraceStatisticsSample, TraceEvidence, TraceRelation, TraceCall,
+                      TraceEvent, TraceSample, TraceProjection):
+            db.execute(delete(model).where(model.snapshot_id.in_(snapshots)))
+        # Revoke old download tickets by removing their artifact records. Shared
+        # upload assets and source task history are intentionally left intact.
+        db.execute(delete(TraceArtifact).where(TraceArtifact.batch_id == bid))
+        db.execute(delete(TraceBinding).where(TraceBinding.batch_id == bid))
+        db.execute(delete(TraceSnapshot).where(TraceSnapshot.batch_id == bid))
+        db.execute(delete(TraceBatch).where(TraceBatch.batch_id == bid))
+        return {"batch_id": bid, "deleted": True}
+    return mutation(db, user, f"DELETE /batches/{bid}", key, body, action)[0]
+
+
+def remove_file(db, user, bid, file_id, body, key):
+    expected = body.get("expected_version")
+    def action():
+        batch = deletion_context(db, bid, expected)
+        binding = db.scalar(select(TraceBinding).where(
+            TraceBinding.batch_id == bid, TraceBinding.file_id == file_id))
+        if not binding:
+            q.fail(404, "文件不属于当前批次或已移除")
+        snapshots = select(TraceSnapshot.snapshot_id).where(TraceSnapshot.batch_id == bid)
+        referenced = db.scalar(select(TraceSample.id).where(
+            TraceSample.snapshot_id.in_(snapshots),
+            TraceSample.payload["source"]["source_id"].as_string() == file_id).limit(1))
+        started = any(file_id in (data.get("file_ids") or []) for data in db.scalars(
+            select(Task.input_data).where(Task.capability_code == "agent_trace_ingest",
+                Task.input_data["batch_id"].as_string() == bid)))
+        if binding.payload.get("parse_status") != "pending" or referenced or started:
+            q.fail(409, "此文件已经开始解析或被历史结果引用，不能单独删除")
+        db.delete(binding)
+        db.flush()
+        pending = any(b.payload.get("parse_status") == "pending" for b in bindings(db, bid))
+        batch.payload = {**batch.payload, "batch_version": expected + 1, "staging_changed": pending}
+        return {"batch": batch_dict(batch, user), "removed_file_id": file_id}
+    return mutation(db, user, f"DELETE /batches/{bid}/files/{file_id}", key, body, action)[0]
 
 
 def bind(db,user,bid,body,key):
@@ -311,13 +371,16 @@ def submit(db,body,user,key,name):
     return mutation(db,user,"/tasks/execute",key,{"capability_code":"agent_trace_ingest","input":body,"name":name},action)
 
 
-def publish(db,batch,tid,parsed,selected_ids):
+def publish(db,batch,tid,parsed,selected_ids,*,current_read=False):
     from app.services.agent_trace_statistics import VERSION as STATS_VERSION
     from app.services.agent_trace_rules import VERSION as RULE_VERSION, audit_process
     from app.services.agent_trace_audit import recorded_audit
     sid=stable_id("snap_",batch.batch_id,tid)
     old=batch.active_snapshot_id
-    carried=list(db.scalars(select(TraceSample).where(TraceSample.snapshot_id==old))) if old else []
+    carried_query=select(TraceSample).where(TraceSample.snapshot_id==old)
+    # A shared internal batch may have advanced after this transaction's first read.
+    # With its batch row locked, read the actual latest rows even under MySQL REPEATABLE READ.
+    carried=list(db.scalars(carried_query.with_for_update() if current_read else carried_query)) if old else []
     carried=[s for s in carried if s.payload["source"]["source_id"] not in selected_ids]
     db.add(TraceSnapshot(snapshot_id=sid,batch_id=batch.batch_id,payload={"schema_version":"1","batch_version_at_start":batch.payload["batch_version"],"sample_count":len(carried)+len(parsed),"data_origin":"actual","rule_version":RULE_VERSION}))
     for version in (VERSION,STATS_VERSION):db.add(TraceProjection(projection_id=stable_id("proj_",sid,version),snapshot_id=sid,version=version,payload={"policy_version":version,"data_origin":"actual"}))
@@ -325,7 +388,8 @@ def publish(db,batch,tid,parsed,selected_ids):
         db.add(TraceSample(id=stable_id("sample_",sid,oldrow.trace_id),snapshot_id=sid,trace_id=oldrow.trace_id,sample_id=oldrow.sample_id,display_id=oldrow.display_id,
             ingest_order=oldrow.ingest_order,language=oldrow.language,result=oldrow.result,payload=oldrow.payload))
         for model in (TraceEvent,TraceCall,TraceRelation,TraceEvidence):
-            for row in db.scalars(select(model).where(model.snapshot_id==old,model.trace_id==oldrow.trace_id)):
+            rows_query=select(model).where(model.snapshot_id==old,model.trace_id==oldrow.trace_id)
+            for row in db.scalars(rows_query.with_for_update() if current_read else rows_query):
                 args={"id":stable_id("row_",sid,row.id),"snapshot_id":sid,"trace_id":row.trace_id,"payload":row.payload}
                 if model==TraceEvent:args.update(event_id=row.event_id,ordinal=row.ordinal)
                 if model==TraceCall:args.update(call_id=row.call_id,ordinal=row.ordinal)
@@ -337,7 +401,7 @@ def publish(db,batch,tid,parsed,selected_ids):
         if carried_row.payload.get("rule_audit", {}).get("version") == RULE_VERSION:
             continue
         execution = deepcopy(carried_row.payload)
-        prior_scope = {"snapshot_id": old}
+        prior_scope = {"snapshot_id": sid}
         execution["events"] = q.process_records(db, prior_scope, carried_row.trace_id, TraceEvent)
         execution["calls"] = q.process_records(db, prior_scope, carried_row.trace_id, TraceCall)
         for event in execution["events"]:
@@ -553,9 +617,11 @@ def workspace(db,params,user):
     output["resolved_selection"]={"batch_id":bid,"snapshot_id":sid,"source_id":source or (chosen.payload["source"]["source_id"] if chosen else None),"trace_id":chosen.trace_id if chosen else None}
     formats=Counter(r.payload["source"].get("format_code","value_analysis") for r in all_rows)
     cats=Counter(sample_item(r)["test_category"] for r in all_rows)
+    from app.services.agent_trace_statistics import CATEGORIES
+    category_labels = {**dict(CATEGORIES), "unknown": "未提供"}
     output["summary"]={"file_count":len(sources),"supported_format_count":3,"imported_format_count":len(formats),"parsed_trace_count":len(all_rows),"failed_record_count":sum(f["failed_record_count"] for f in file_rows),
         "category_mode":"single","by_language":[{"code":l,"count":n} for l,n in Counter(r.language for r in all_rows).items()],
-        "by_category":[{"code":c,"label":c,"count":n} for c,n in cats.items()],"by_format":[{"code":c,"trace_count":n} for c,n in formats.items()]}
+        "by_category":[{"code":c,"label":category_labels.get(c,c),"count":n} for c,n in cats.items()],"by_format":[{"code":c,"trace_count":n} for c,n in formats.items()]}
     metrics=[]
     for code,issue in (("structure","structure_invalid"),("call_link","call_unlinked"),("time","time_missing"),("usage","usage_missing")):
         na=sum(r.payload["call_count"]==0 and "call_unlinked" not in r.payload.get("issue_types",[]) for r in all_rows) if code=="call_link" else 0

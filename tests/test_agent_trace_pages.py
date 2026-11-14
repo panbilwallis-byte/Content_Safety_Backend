@@ -50,6 +50,7 @@ from app.services.agent_trace_trajectory import EXAMPLE as TRAJECTORY
 LANGCHAIN={"runs":[{"id":"root_1","parent_run_id":None,"run_type":"chain","inputs":{"q":"one"},"outputs":{"answer":"one"}},
                     {"id":"tool","parent_run_id":"root_1","run_type":"tool","name":"web.search","inputs":{"q":"one"},"outputs":{"text":"one"}},
                     {"id":"root_2","parent_run_id":None,"run_type":"chain","inputs":{"q":"two"},"outputs":{"answer":"two"}}]}
+LANGCHAIN_SINGLE={"runs": LANGCHAIN["runs"][:2]}
 
 
 def parse(pages,batch,file_ids,explicit=None):
@@ -103,6 +104,19 @@ def test_real_adapter_and_four_view_identity(pages,record,fmt,total):
     t=pages["client"].get(f"{ROOT}/batches/{batch['batch_id']}/samples/{trace}",params={**scope,"view":"tools"})
     assert t.status_code==200,t.text
     assert t.json()["data"]["trace_id"]==trace
+    calls = t.json()["data"]["calls"]["items"]
+    if calls:
+        call = calls[0]
+        for mode in ("raw", "redacted"):
+            execution = pages["client"].get(
+                f"{ROOT}/batches/{batch['batch_id']}/samples/{trace}",
+                params={**scope, "view": "execution", "section": "selection",
+                        "event_id": call["event_id"], "redaction_mode": mode})
+            assert execution.status_code == 200, execution.text
+            data = execution.json()["data"]
+            assert data["selection"]["tool_name"] == call["tool_name"]
+            preview = next(e for e in data["events"]["items"] if e["event_id"] == call["event_id"])
+            assert preview["selection_preview"]["tool_name"] == call["tool_name"]
 
 
 def test_statistics_full_contract_filters_and_navigation(pages):
@@ -129,7 +143,7 @@ def test_statistics_full_contract_filters_and_navigation(pages):
 
 
 def test_source_filter_does_not_change_ingest_batch_summary(pages):
-    batch=create(pages);one=upload(pages,dumps(OPENAI),"one.json");two=upload(pages,dumps(ANTHROPIC),"two.json")
+    batch=create(pages);one=upload(pages,dumps(OPENAI),"one.json");two=upload(pages,dumps(LANGCHAIN_SINGLE),"two.json")
     task=parse(pages,batch,[one,two]);scope={"batch_id":batch["batch_id"],"snapshot_id":task["result"]["snapshot_id"]}
     w=pages["client"].get(ROOT+"/workspace",params={**scope,"source_id":one}).json()["data"]
     assert w["summary"]["parsed_trace_count"]==2 and w["sample_page"]["total"]==1
@@ -258,7 +272,7 @@ def test_incremental_publish_keeps_old_snapshot(pages):
     batch=create(pages);one=upload(pages,dumps(OPENAI),"first.json")
     first=parse(pages,batch,[one]);old=first["result"]["snapshot_id"]
     before=pages["client"].get(ROOT+"/workspace",params={"batch_id":batch["batch_id"]}).json()["data"]
-    two=upload(pages,dumps(ANTHROPIC),"second.json")
+    two=upload(pages,dumps(LANGCHAIN_SINGLE),"second.json")
     second=parse(pages,before["batch"],[two]);assert second["status"]=="succeeded"
     after=pages["client"].get(ROOT+"/workspace",params={"batch_id":batch["batch_id"]}).json()["data"]
     assert after["summary"]["parsed_trace_count"]==2

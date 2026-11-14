@@ -258,6 +258,8 @@ def workspace(db, params, view, user):
     candidates = list(db.scalars(query))
     accessible = []
     for b in candidates:
+        if b.payload.get("merged_into"):
+            continue
         try:
             llm_access(db, b)
         except HTTPException:
@@ -341,12 +343,14 @@ def timing(payload, calls):
 
 
 def tool_detail(db, batch, scope, trace, params, user):
+    from app.services.agent_trace_tool_analysis import explain_calls, efficiency_groups
     sample = get_sample(db, scope, trace)
     section = params.get("section", "overview")
     if section not in {"overview", "calls", "sequence", "selection"}:
         fail(422, "工具交互 section 无效")
     calls = process_records(db, scope, trace, TraceCall)
-    calls = redact(calls, preserve_ids=True)
+    groups = redact(efficiency_groups(sample.payload, calls), preserve_ids=True)
+    calls = redact(explain_calls(calls), preserve_ids=True)
     lookup = {c["call_id"]: c for c in calls}
     cid = params.get("call_id")
     if cid and cid not in lookup:
@@ -401,12 +405,13 @@ def tool_detail(db, batch, scope, trace, params, user):
             "inefficient_count": sum(any(t["code"] == "inefficient" for t in c["behavior_tags"]) for c in calls)},
         "rule_findings": redact(sample.payload.get("rule_findings", []), preserve_ids=True), "rule_audit": sample.payload.get("rule_audit"),
         "timing": timing(sample.payload, calls), "sequence": sequence, "calls": calls_page, "selection": selected,
-        "sample_analysis": {"inefficiency_groups": sample.payload.get("inefficiency_groups", [])},
+        "sample_analysis": {"inefficiency_groups": groups},
         "permissions": permissions(user), "data_origin": sample.payload["data_origin"],
         "warnings": [{"code": "generated_process", "message": "含模拟过程，不是实际风险审计证据"}] if sample.payload["data_origin"] != "actual" else []}
 
 
 def execution_detail(db, scope, trace, params, user):
+    from app.services.agent_trace_provenance import build_risk_provenance
     sample = get_sample(db, scope, trace)
     section = params.get("section", "overview")
     if section not in {"overview", "events", "selection", "graph"}:
@@ -416,12 +421,20 @@ def execution_detail(db, scope, trace, params, user):
         fail(422, "脱敏模式无效")
     if mode == "raw" and not permissions(user)["can_view_raw"]:
         fail(403, "没有原文查看权限")
-    events = process_records(db, scope, trace, TraceEvent)
-    if mode != "raw":
-        events = redact(events, preserve_ids=True)
+    original_events = process_records(db, scope, trace, TraceEvent)
+    events = original_events if mode == "raw" else redact(original_events, preserve_ids=True)
+    original_calls = process_records(db, scope, trace, TraceCall)
+    calls = original_calls if mode == "raw" else redact(original_calls, preserve_ids=True)
+    tool_names = {c["event_id"]: c.get("tool_name") for c in calls}
     evidence = [deepcopy(e.payload) for e in db.scalars(select(TraceEvidence).where(
         TraceEvidence.snapshot_id == scope["snapshot_id"], TraceEvidence.trace_id == trace,
         TraceEvidence.projection_version == scope["projection_version"])) if e.payload.get("review_status") != "dismissed"]
+    provenance = build_risk_provenance(
+        original_events, original_calls, evidence,
+        data_origin=sample.payload.get("data_origin", "actual"), sanitize=redact if mode != "raw" else lambda value: value)
+    # Match on the frozen original records; apply the same viewing policy to every excerpt.
+    if mode != "raw":
+        provenance = redact(provenance, preserve_ids=True)
     if mode != "raw":
         evidence = redact(evidence,preserve_ids=True)
     first_risk = next((e["event_id"] for e in events if any(x["event_id"] == e["event_id"] for x in evidence)), None)
@@ -457,6 +470,7 @@ def execution_detail(db, scope, trace, params, user):
             lineage_nodes.append({"id":references["source_id"],"kind":"source","label":"来源记录","event_id":None,"source_ref":references})
         lineage_nodes.append({"id":event["event_id"],"kind":"event","event_id":event["event_id"],"label":event["label"]})
         return {"event_id": event["event_id"], "display_id": event["display_id"], "ordinal": event["ordinal"],
+            "tool_name": tool_names.get(event["event_id"]) if event["event_type"] == "tool_call" else None,
             "graph_locator":{"cursor":cursor(scope,trace,"graph",idx//500*500,user) if idx>=500 else None},
             "previous_event_id": events[idx - 1]["event_id"] if idx else None,
             "next_event_id": events[idx + 1]["event_id"] if idx + 1 < len(events) else None,
@@ -470,7 +484,7 @@ def execution_detail(db, scope, trace, params, user):
     sp = page(rendered, num, size)
     selected = next((selection(e) for e in events if e["event_id"] == eid), None)
     common = {"view": "execution", "section": section, "scope": {**scope, "permissions_version": "platform-v1"},
-              "trace_id": trace, "first_risk_event_id": first_risk}
+              "trace_id": trace, "first_risk_event_id": first_risk, "risk_provenance": provenance}
     if params.get("selection_cursor"):
         if section!="selection" or not selected:fail(422,"长内容游标要求selection和event_id")
         token=unsign(params["selection_cursor"])

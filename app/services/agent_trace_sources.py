@@ -8,8 +8,8 @@ def legacy_enabled():
 
 def visible(batch):
     # Old generated value projections remain stored, but are opt-in only.
-    return batch.source_system in {"upload", "internal_model"} or legacy_enabled()
+    return batch.source_system in {"upload", "internal_model", "internal_agent"} or legacy_enabled()
 
 
 def origin(batch):
-    return "platform" if batch.source_system == "internal_model" else "external_import"
+    return "platform" if batch.source_system in {"internal_model", "internal_agent"} else "external_import"
