@@ -52,8 +52,11 @@ def audit_process(payload, events, calls, source_evidence=(), record=None):
     coordinates = {}
     if isinstance(record, dict) and isinstance(record.get("messages"), list):
         from app.services.agent_trace_competition import analyze, parse
-        report = analyze(record)
+        from app.services.agent_trace_security import security_findings
+        # Finalize unified risk decisions before choosing reviewed excerpts.
+        report = analyze(record, apply_annotations=False)
         scoring_calls, _, _, _, _, locations = parse(record)
+        all_risks = security_findings(record["messages"], scoring_calls)
         by_location = {(c["message_index"], c["call_index"]): c for c in scoring_calls}
         by_step = {c["step_id"]: c for c in scoring_calls}
         for event in events:
@@ -110,7 +113,8 @@ def audit_process(payload, events, calls, source_evidence=(), record=None):
         calls_by_event = {c["event_id"]: c for c in calls}
         events_by_location = {(c.get("message_index"), c.get("call_index")): event_id
                               for event_id, c in coordinates.items() if "call_index" in c and by_id[event_id].get("event_type") == "tool_call"}
-        for risk in report["results"]["B3"]["risks"]:
+        # Internal audit keeps every finding; B3 is only the first-risk projection.
+        for risk in all_risks:
             event_id = events_by_location.get((risk["message_index"], risk["call_index"]))
             if event_id:
                 add(risk["rule_id"], "security", risk["label"], event_id, risk["risk_quote"],
@@ -205,14 +209,17 @@ def audit_process(payload, events, calls, source_evidence=(), record=None):
     payload["risk_steps"] = sorted({f["competition_step"] for f in security if f.get("competition_step") is not None})
     payload["first_risk_step"] = payload["risk_steps"][0] if payload["risk_steps"] else None
     if report is not None and record.get("trajectory_id"):
+        from app.services.agent_trace_competition import first_risk
         report["results"]["B2"]["judgment"] = "有风险" if payload["audit_decision"] == "risk_found" else "无风险"
-        report["results"]["B3"].update(first_risk_step=payload["first_risk_step"], risks=[{
+        report["results"]["B3"].update(first_risk_step=payload["first_risk_step"], risks=first_risk([{
             "step_id": f.get("competition_step"), "message_index": f.get("message_index"),
             "call_index": f.get("call_index"), "rule_id": f["rule_id"], "risk_quote": f["evidence_text"],
             "severity": f["severity"], "outcome": f["outcome"], "label": f["label"],
             "event_id": f["event_id"], "call_id": f["call_id"],
             "evidence": f.get("source_evidence") or [{"message_index": f.get("message_index"), "quote": f["evidence_text"]}]
-            } for f in sorted(security, key=lambda f: (f.get("competition_step") or float("inf"), event_positions[f["event_id"]]))])
+            } for f in sorted(security, key=lambda f: (f.get("competition_step") or float("inf"), event_positions[f["event_id"]]))]))
+        from app.services.agent_trace_reviewed_evidence import apply_reviewed_evidence
+        apply_reviewed_evidence(record, report["results"], locations)
         payload["competition_report"] = report
     payload["rule_findings"] = findings
     payload["rule_audit"] = {"version": VERSION, "status": "completed", "scope": SCOPE,

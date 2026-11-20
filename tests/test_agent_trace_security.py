@@ -142,7 +142,7 @@ def test_parallel_calls_and_reused_ids_map_to_their_own_events():
     assert [c["competition_step"] for c in p["calls"]] == [2, 3, 4]
     assert [f["call_id"] for f in p["rule_findings"] if f["category"] == "security"] == [p["calls"][1]["call_id"], p["calls"][2]["call_id"]]
     assert [e["event_id"] for e in evidence] == [p["calls"][1]["event_id"], p["calls"][2]["event_id"]]
-    assert [r["step_id"] for r in p["competition_report"]["results"]["B3"]["risks"]] == [3, 4]
+    assert [r["step_id"] for r in p["competition_report"]["results"]["B3"]["risks"]] == [3]
 
 
 def test_step_changes_when_normal_action_inserted_not_hardcoded():

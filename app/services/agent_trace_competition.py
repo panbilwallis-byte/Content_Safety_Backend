@@ -7,12 +7,12 @@ from copy import deepcopy
 import json
 import re
 
-VERSION = "competition-v2"
+VERSION = "competition-v4"
 MISSING = "未提供"
 NAMES = {
     "A1": "数据统计指标可视化①：输入、输出token数",
     "A2": "数据统计指标可视化②：思考内容字符总量",
-    "A3": "数据统计指标可视化③：工具调用次数和种类",
+    "A3": "数据统计指标可视化③：工具调用次数与种类",
     "A4": "数据统计指标可视化④：多条轨迹展示与工具调用汇总",
     "B1": "思维链可视化质量①：按原始顺序展示完整思考内容",
     "B2": "思维链可视化质量②：判断轨迹是否有风险",
@@ -27,6 +27,71 @@ NAMES = {
 
 def text(value):
     return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+
+
+def first_risk(risks):
+    """Project all findings to one earliest scoring step, keeping its evidence."""
+    located = [r for r in risks if type(r.get("step_id")) is int and r["step_id"] > 0]
+    if not located:
+        return []
+    step = min(r["step_id"] for r in located)
+    earliest = [r for r in located if r["step_id"] == step]
+    result = deepcopy(earliest[0])
+    result["evidence"] = []
+    for risk in earliest:
+        for item in risk.get("evidence", []):
+            if item not in result["evidence"]:
+                result["evidence"].append(deepcopy(item))
+    return [result]
+
+
+def execution_failures(call, command):
+    """Classify explicit runtime diagnostics, retaining their exact return location."""
+    from app.services.agent_trace_security import shell_commands
+    downloads = False
+    for tokens in shell_commands(command):
+        if tokens[0].rsplit("/", 1)[-1] != "curl":
+            continue
+        for i, token in enumerate(tokens[1:], 1):
+            if token in {"-O", "--remote-name"}:
+                downloads = True
+            if token in {"-o", "--output"} and i + 1 < len(tokens):
+                downloads |= tokens[i + 1] not in {"/dev/null", "-"}
+            elif token.startswith("--output="):
+                downloads |= token.split("=", 1)[1] not in {"/dev/null", "-"}
+    rules = [
+        (r"^User aborted the command$", "执行被用户中止"),
+        (r"^curl:\s*\(23\).*Failure writing output", "输出写入失败"),
+        (r"^curl:\s*\(28\)", "下载超时" if downloads else "网络请求超时"),
+        (r"^NO NET \(exit 28\)$", "网络请求超时"),
+        (r"^Command exited with code 124$", "执行超时"),
+        (r"^(?:/usr)?(?:/bin/)?(?:ba)?sh:.*command not found", "命令不存在"),
+        (r"^(?:/usr)?(?:/bin/)?(?:ba)?sh:.*No such file|^Error:.*(?:403|404)", "命令或请求失败"),
+        (r"^(?:tool|command|operation)\b.*timed out|^execution\b.*timeout", "工具超时"),
+        (r"^Traceback \(most recent call last\):$", "运行异常"),
+    ]
+    found = {}
+    for returned in call["returns"]:
+        output = text(returned["content"])
+        fenced = False
+        for line in output.splitlines():
+            if line.lstrip().startswith("```"):
+                fenced = not fenced
+                continue
+            if fenced:
+                continue
+            for pattern, error in rules:
+                if error == "运行异常" and "blocked for fallback test" in output:
+                    continue
+                if re.search(pattern, line.strip(), re.I):
+                    item = {"step_id": call["step_id"], "message_index": returned["message_index"], "quote": line}
+                    evidence = found.setdefault(error, [])
+                    if item not in evidence:
+                        evidence.append(item)
+                    break
+    # Nonzero exit codes alone (including requested target crashes) are insufficient.
+    return [{"step_id": call["step_id"], "error_type": error, "evidence": evidence}
+            for error, evidence in found.items()]
 
 
 def parse(record):
@@ -91,7 +156,7 @@ def parse(record):
     return calls, segments, absent, unmatched, missing, locations
 
 
-def analyze(record):
+def analyze(record, *, apply_annotations=True):
     calls, segments, absent, unmatched, missing, locations = parse(record)
     messages = record["messages"]
     counts = Counter(c["tool_name"] for c in calls if isinstance(c["tool_name"], str))
@@ -101,7 +166,7 @@ def analyze(record):
         return [{"step_id": c["step_id"], "message_index": c["message_index"], "quote": text(c["arguments"])}] + [
             {"step_id": c["step_id"], **r, "quote": text(r["content"])} for r in c["returns"]]
     from app.services.agent_trace_security import security_findings
-    risks = security_findings(messages, calls)
+    risks = first_risk(security_findings(messages, calls))
     failures, repeats, truncations = [], [], []
     history = {}
     for c in calls:
@@ -112,16 +177,7 @@ def analyze(record):
             decoded = {}
         command = decoded.get("command", decoded.get("cmd", "")) if isinstance(decoded, dict) else ""
         outputs = "\n".join(text(r["content"]) for r in c["returns"])
-        error = None
-        if re.search(r"(?i)(?:tool|command|operation).*timed out|curl: \(28\)|execution.*timeout|Command exited with code 124|NO NET \(exit 28\)", outputs):
-            error = "工具超时"
-        elif re.search(r"(?m)^(?:/usr)?(?:/bin/)?(?:ba)?sh:.*(?:command not found|No such file)|^Error:.*(?:403|404)|^error:.*(?:403|404)", outputs):
-            error = "命令或请求失败"
-        elif re.search(r"(?m)^Traceback \(most recent call last\):", outputs) and "blocked for fallback test" not in outputs:
-            error = "运行异常"
-        # A task explicitly asking for a crash must not classify its crash as a tool error.
-        if error:
-            failures.append({"step_id": c["step_id"], "error_type": error, "evidence": call_evidence(c)})
+        failures.extend(execution_failures(c, command))
         key = (c["tool_name"], args)
         previous = history.get(key)
         # A successful read repeated without any intervening mutation is redundant.
@@ -163,10 +219,20 @@ def analyze(record):
             issue = {"source_subitem": source, **item}
             if "evidence" not in issue:
                 i = item.get("message_index")
-                issue["evidence"] = [evidence(i, text(messages[i].get("content")))] if i is not None else []
+                if i is not None and "quote" in item:
+                    # The truncation quote already came from the identified source field.
+                    issue["evidence"] = [evidence(i, item["quote"])]
+                elif i is not None and "content" in item:
+                    issue["evidence"] = [evidence(i, text(item["content"]))]
+                else:
+                    # Missing fields / metadata have no message-body quote to invent.
+                    issue["evidence"] = []
             result["C5"]["issues"].append(issue)
     for key, value in result.items():
         value["指标"] = NAMES[key]
+    if apply_annotations:
+        from app.services.agent_trace_reviewed_evidence import apply_reviewed_evidence
+        apply_reviewed_evidence(record, result, locations)
     return {"trajectory_id": record.get("trajectory_id"), "analysis_version": VERSION, "results": result}
 
 

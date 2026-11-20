@@ -89,6 +89,8 @@ def test_full_description_and_evidence_summary_for_hover(actual, mode):
     event = data["events"]["items"][2]
     expected = actual["original"] if mode == "raw" else q.redact(actual["original"])
     assert event["description"] == expected
+    assert event["original_text"] == expected
+    assert len(event["original_text"]) > 16384
     assert len(event["description"]) > 512
     evidence = event["selection_preview"]["risk_evidence"]["items"]
     assert all(item["match_pattern"] in event["evidence_summary"] for item in evidence)
@@ -109,6 +111,7 @@ def test_historical_description_recovery_preserves_independent_description(actua
         db.commit()
     data = fetch(actual, section="overview", redaction_mode="raw").json()["data"]
     assert data["events"]["items"][2]["description"] == (description if independent else actual["original"])
+    assert data["events"]["items"][2]["original_text"] == actual["original"]
     with actual["sessions"]() as db:
         assert db.scalar(select(TraceEvent).where(TraceEvent.snapshot_id == actual["scope"]["snapshot_id"],
                                                  TraceEvent.event_id == actual["events"][2]["event_id"])).payload == saved
@@ -216,6 +219,8 @@ def test_missing_original_never_falls_back_to_display_summary(actual, change):
     response = fetch(actual)
     assert response.status_code == 404
     assert "完整原文" in response.json()["message"]
+    overview = fetch(actual, section="overview").json()["data"]
+    assert overview["events"]["items"][2]["original_text"] is None
 
 
 def test_empty_original_is_valid_complete_source(actual):
@@ -226,6 +231,8 @@ def test_empty_original_is_valid_complete_source(actual):
         db.commit()
     document = fetch(actual).json()["data"]
     assert document["original_text"] == "" and document["complete"] is True
+    overview = fetch(actual, section="overview").json()["data"]
+    assert overview["events"]["items"][2]["original_text"] == ""
 
 
 @pytest.mark.parametrize("section", ["overview", "events", "selection"])

@@ -584,6 +584,7 @@ def execution_detail(db, scope, trace, params, user):
             "lineage": {"nodes":lineage_nodes,"total_nodes":len(lineage_nodes),"complete":True,"unresolved_refs":[],"next_cursor":None,
                         "edges": [{"from_id":references["source_id"],"to_id":event["event_id"],"relation":"source_reference"}] if references.get("source_id") else [], "availability": "available"}}
     rendered = [{**{k: v for k, v in e.items() if k not in {"source_excerpt", "reasoning_summary", "reasoning_original"}},
+                 "original_text": recorded_event_text(e),
                  **risk_fields(e),
                  "selection_preview": selection(e, 4096)} for e in events]
     sp = page(rendered, num, size)

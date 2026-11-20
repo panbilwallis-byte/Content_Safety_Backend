@@ -96,12 +96,29 @@ def filtered(data, kind):
             (kind == "missing_fields" and st.payload["missing_fields"])]
 
 
+def reasoning_char_count(sample):
+    """Read saved character totals without changing the snapshot or token usage."""
+    report = sample.payload.get("competition_report") or {}
+    count = report.get("results", {}).get("A2", {}).get("known_characters")
+    if type(count) is int and count >= 0:
+        return count
+    # Ordinary/older imports may have original messages but no scoring report.
+    record = sample.result.get("source_record") or {}
+    messages = record.get("messages")
+    if isinstance(messages, list):
+        return sum(len(body) for m in messages if isinstance(m, dict)
+                   for body in [m.get("reasoning_content") or m.get("reasoning")]
+                   if isinstance(body, str))
+    return None
+
+
 def summary(s, st, scope, user):
     p, v = s.payload, st.payload
     return {**scope, "language": s.language, "trace_id": s.trace_id, "display_id": s.display_id,
         "source_id": p["source"]["source_id"], "filename": p["source"].get("filename", "价值分析记录"),
         "source_format": p["source"].get("format_code", "value_analysis"), "test_category": v["test_category"],
         "test_category_label": dict(CATEGORIES).get(v["test_category"], "未知"), "token_usage": v["token_usage"],
+        "reasoning_char_count": reasoning_char_count(s),
         "event_count": p["event_count"], "call_count": p["call_count"], "retry_count": p.get("retry_count", 0),
         "duration_ms": p.get("duration_ms"), "task_status": v["task_status"], "audit_decision": v["audit_decision"],
         "risk_level": p.get("risk_level", "unknown"), "risk_types": p.get("risk_types", []),
