@@ -72,6 +72,12 @@ def bind_files(batch_id: str, request: Request, body: dict = Body(...), user=Dep
     return success(ingest.bind(db, user, batch_id, body, request.headers.get("X-Request-Id")))
 
 
+@router.post(root + "/batches/{batch_id}/deletions")
+def delete_item(batch_id: str, request: Request, body: dict = Body(...), user=Depends(actor), db=Depends(get_db)):
+    from app.services import agent_trace_ingest as ingest
+    return success(ingest.delete_item(db, user, batch_id, body, request.headers.get("X-Request-Id")))
+
+
 @router.get(root + "/batches/{batch_id}/samples")
 def samples(batch_id: str, request: Request, view: str = Query("ingest"), user=Depends(actor), db=Depends(get_db)):
     view_param(view)
@@ -85,6 +91,19 @@ def samples(batch_id: str, request: Request, view: str = Query("ingest"), user=D
         from app.services import agent_trace_ingest as ingest
         return success(ingest.samples(db, scope, params))
     return success(service.samples(db, scope, dict(request.query_params), view))
+
+
+@router.get(root + "/batches/{batch_id}/competition-report")
+def competition_report(batch_id: str, request: Request, user=Depends(actor), db=Depends(get_db)):
+    from app.services.agent_trace_competition import report
+    params = dict(request.query_params)
+    # Accept the existing Vue client's camelCase snapshot parameter as well.
+    if params.get("snapshotId"):
+        if params.get("snapshot_id") and params["snapshot_id"] != params["snapshotId"]:
+            service.fail(422, "snapshotId 与 snapshot_id 不一致")
+        params["snapshot_id"] = params["snapshotId"]
+    _, scope = service.resolve(db, batch_id, params)
+    return success(report(db, scope, user))
 
 
 @router.get(root + "/batches/{batch_id}/samples/{trace_id}")

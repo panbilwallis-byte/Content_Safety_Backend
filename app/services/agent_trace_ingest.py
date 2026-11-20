@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 import hashlib
 import json
 import logging
+import math
 from pathlib import Path
 from uuid import uuid4
 
@@ -14,7 +15,7 @@ from app.core.database import SessionLocal
 from app.core.time import now_shanghai
 from app.models.tables import Task
 from app.models.agent_traces import (TraceAsset, TraceBinding, TraceBatch, TraceSnapshot, TraceProjection,
-    TraceSample, TraceEvent, TraceCall, TraceRelation, TraceEvidence, TraceIdempotency)
+    TraceSample, TraceEvent, TraceCall, TraceRelation, TraceEvidence, TraceIdempotency, TraceStatisticsSample, TraceArtifact)
 from app.services.agent_trace_generation import VERSION, stable_id, generated_sample, validate_process, dumps
 from app.services import agent_trace_query as q
 
@@ -58,6 +59,9 @@ def mutation(db, user, path, key, payload, action):
         if old and old.payload_hash==digest:
             return deepcopy(old.result),False
         q.fail(409,"并发请求发生冲突，请刷新后重试")
+    except Exception:
+        db.rollback()
+        raise
 
 
 def register_asset(db, user, file_id, filename, path, size, digest, request_id):
@@ -97,17 +101,155 @@ def create_batch(db,user,name,key):
 
 
 def check_edit(db,bid):
-    batch=db.scalar(select(TraceBatch).where(TraceBatch.batch_id==bid).with_for_update())
+    # A no-op write also serializes batch mutations on SQLite, where FOR UPDATE is ignored.
+    db.execute(update(TraceBatch).where(TraceBatch.batch_id==bid).values(payload=TraceBatch.payload)
+               .execution_options(synchronize_session=False))
+    batch=db.scalar(select(TraceBatch).where(TraceBatch.batch_id==bid).with_for_update()
+                    .execution_options(populate_existing=True))
     if not batch:q.fail(404,"批次不存在")
     q.llm_access(db,batch)
     if batch.source_system!="upload":q.fail(409,"价值分析批次由分析任务管理，请创建独立上传批次")
-    running=db.scalar(select(Task.task_id).where(Task.capability_code=="agent_trace_ingest",Task.status.in_(["pending","running"]),Task.input_data["batch_id"].as_string()==bid))
+    running=db.scalar(select(Task.task_id).where(Task.capability_code=="agent_trace_ingest",Task.status.in_(["pending","running"]),Task.input_data["batch_id"].as_string()==bid).with_for_update())
     if running:q.fail(409,"当前批次正在解析，任务："+running)
     return batch
 
 
-def bindings(db,bid):
-    return list(db.scalars(select(TraceBinding).where(TraceBinding.batch_id==bid).order_by(TraceBinding.file_id)))
+def bindings(db,bid,lock=False):
+    query = select(TraceBinding).where(TraceBinding.batch_id==bid).order_by(TraceBinding.file_id)
+    if lock:
+        query = query.with_for_update().execution_options(populate_existing=True)
+    return list(db.scalars(query))
+
+
+def lock_asset(db, file_id):
+    db.execute(update(TraceAsset).where(TraceAsset.file_id == file_id).values(owner_id=TraceAsset.owner_id)
+               .execution_options(synchronize_session=False))
+    return db.scalar(select(TraceAsset).where(TraceAsset.file_id == file_id).with_for_update()
+                     .execution_options(populate_existing=True))
+
+
+def contains_reference(value, references):
+    if isinstance(value, str):
+        return value in references
+    if isinstance(value, dict):
+        return any(contains_reference(v, references) for v in value.values())
+    if isinstance(value, list):
+        return any(contains_reference(v, references) for v in value)
+    return False
+
+
+def cleanup_asset(db, user, file_id):
+    """Retryable cleanup after unbinding; serialize against new batch bindings."""
+    try:
+        # A replay may have opened a repeatable-read snapshot before another binding committed.
+        db.commit()
+        asset = lock_asset(db, file_id)
+        if asset is None:
+            db.commit()
+            return "deleted"
+        if asset.owner_id != str(user["uid"]):
+            db.rollback()
+            return "retained"
+        references = {file_id, asset.storage_path}
+        referenced = db.scalar(select(TraceBinding.id).where(TraceBinding.file_id == file_id).limit(1)) is not None
+        if not referenced:
+            referenced = any(contains_reference(row, references) for row in db.scalars(select(TraceSample.payload)))
+        if not referenced:
+            referenced = any(contains_reference(row, references) for row in db.scalars(select(TraceSample.result)))
+        if not referenced:
+            referenced = any(contains_reference(row, references) for row in db.scalars(select(TraceSnapshot.payload)))
+        if not referenced:
+            referenced = any(contains_reference([task.input_data, task.config, task.result], references)
+                             for task in db.scalars(select(Task)))
+        if referenced:
+            db.commit()
+            return "retained"
+        from app.routers.files import UPLOAD_DIR
+        root = UPLOAD_DIR.resolve()
+        path = Path(asset.storage_path).resolve()
+        if not path.is_relative_to(root) or path == root:
+            db.rollback()
+            logging.getLogger(__name__).warning("Refusing asset cleanup outside upload directory: %s", file_id)
+            return "pending"
+        path.unlink(missing_ok=True)
+        db.delete(asset)
+        db.commit()
+        return "deleted"
+    except Exception:
+        db.rollback()
+        logging.getLogger(__name__).exception("Asset cleanup pending for %s", file_id)
+        return "pending"
+
+
+def delete_item(db, user, bid, body, key):
+    expected = body.get("expected_version")
+    file_id = body.get("file_id")
+    if type(expected) is not int or expected < 1 or "file_id" not in body:
+        q.fail(422, "expected_version须为正整数，file_id必须显式提供")
+    if file_id is not None and (not isinstance(file_id, str) or not file_id.strip()):
+        q.fail(422, "file_id须为非空字符串或null")
+    if not q.permissions(user)["can_export"]:
+        q.fail(403, "当前账号为只读，不能修改轨迹数据")
+    # Replays still check current access, but may refer to an already deleted resource.
+    batch = db.get(TraceBatch, bid)
+    if batch:
+        q.llm_access(db, batch)
+        if batch.source_system != "upload":
+            q.fail(409, "仅独立上传批次支持删除")
+    asset = db.get(TraceAsset, file_id) if file_id is not None else None
+    if asset and asset.owner_id != str(user["uid"]):
+        q.fail(403, "没有此上传文件的访问权限")
+
+    def action():
+        batch = check_edit(db, bid)
+        if batch.payload.get("batch_version", 1) != expected:
+            q.fail(409, "批次版本冲突，当前版本：" + str(batch.payload.get("batch_version", 1)))
+        if file_id is not None:
+            asset = lock_asset(db, file_id)
+            if asset is None:
+                q.fail(404, "上传文件不存在")
+            if asset.owner_id != str(user["uid"]):
+                q.fail(403, "没有此上传文件的访问权限")
+            binding = db.scalar(select(TraceBinding).where(TraceBinding.batch_id == bid, TraceBinding.file_id == file_id)
+                                .with_for_update().execution_options(populate_existing=True))
+            if binding is None:
+                q.fail(404, "文件不属于当前批次")
+            p = binding.payload
+            if p.get("parse_status") not in {"pending", "failed"} or p.get("parsed_trace_count") != 0:
+                q.fail(409, "仅允许删除待解析或解析失败且成功解析数为零的文件")
+            db.delete(binding)
+            batch.payload = {**batch.payload, "batch_version": expected + 1, "staging_changed": True}
+            result_batch = batch_dict(batch, user)
+        else:
+            if bindings(db, bid, lock=True):
+                q.fail(409, "批次仍有文件，不能删除")
+            snapshots = list(db.scalars(select(TraceSnapshot).where(TraceSnapshot.batch_id == bid).with_for_update()))
+            sids = [s.snapshot_id for s in snapshots]
+            for model in (TraceSample, TraceEvent, TraceCall, TraceRelation, TraceEvidence, TraceStatisticsSample):
+                if sids and db.scalar(select(model.id).where(model.snapshot_id.in_(sids)).limit(1)) is not None:
+                    q.fail(409, "批次仍有历史轨迹，不能删除")
+            if db.scalar(select(TraceArtifact.artifact_id).where(TraceArtifact.batch_id == bid).limit(1)):
+                q.fail(409, "批次仍有关联导出产物，不能删除")
+            for projection in db.scalars(select(TraceProjection).where(TraceProjection.snapshot_id.in_(sids))):
+                db.delete(projection)
+            for snapshot in snapshots:
+                db.delete(snapshot)
+            db.delete(batch)
+            result_batch = None
+        db.flush()
+        return {"deleted": True, "batch_id": bid, "file_id": file_id, "batch": result_batch,
+                "asset_cleanup": "pending" if file_id is not None else "not_applicable"}
+
+    path = f"/batches/{bid}/deletions"
+    result, _ = mutation(db, user, path, key, body, action)
+    result = deepcopy(result)
+    if file_id is not None:
+        result["asset_cleanup"] = cleanup_asset(db, user, file_id)
+        from app.services.agent_trace_export import idem_key
+        record = db.get(TraceIdempotency, idem_key(user["uid"], path, key))
+        record.result = result
+        db.commit()
+    return result
 
 
 def bind(db,user,bid,body,key):
@@ -131,10 +273,15 @@ def bind(db,user,bid,body,key):
     def action():
         b=check_edit(db,bid)
         if b.payload.get("batch_version",1)!=expected:q.fail(409,"批次版本冲突，当前版本："+str(b.payload.get("batch_version",1)))
+        for file_id in sorted(a.file_id for a in assets):
+            locked = lock_asset(db, file_id)
+            if locked is None:q.fail(404,"上传文件不存在")
+            if locked.owner_id != str(user["uid"]):q.fail(403,"没有此上传文件的访问权限")
         changed=False
         for f,asset in zip(files,assets):
             identity=stable_id("bind_",bid,asset.file_id)
-            row=db.get(TraceBinding,identity)
+            row=db.scalar(select(TraceBinding).where(TraceBinding.id==identity).with_for_update()
+                          .execution_options(populate_existing=True))
             override=f.get("format_override","auto")
             if row is None or row.payload.get("format_override")!=override:
                 changed=True
@@ -183,11 +330,18 @@ def normalize(record,file_id,index,raw,line,override):
         raise ValueError("无法识别或格式覆盖与记录结构不匹配")
     if override!="auto" and detected!=fmt:raise ValueError("格式覆盖与核心结构不一致")
     trace=stable_id("trc_",file_id,index)
+    competition = None
+    if fmt == "openai_messages" and "trajectory_id" in record:
+        identity = record["trajectory_id"]
+        if not isinstance(identity, str) or not identity or len(identity) > 255 or identity == "aggregate":
+            raise ValueError("trajectory_id 必须为1至255字符，且不能为 aggregate")
+        from app.services.agent_trace_competition import analyze
+        competition = analyze(record)
     events=[];calls=[];pending={}; issues=[]
     def event(kind,role,text,path):
         n=len(events)+1;eid=stable_id("ev_",trace,n)
         e={"event_id":eid,"display_id":f"STEP-{n:02}","ordinal":n,"event_type":kind,"label":{"tool_call":"工具调用","tool_result":"工具返回","message":"消息","run":"运行记录"}.get(kind,kind),
-            "role":role,"description":str(text)[:512],"source_excerpt":str(text),"reasoning_summary":"源日志未记录推理摘要", "risk_level":"unknown","relative_time_ms":None,"call_id":None,
+            "role":role,"description":str(text),"source_excerpt":str(text),"reasoning_summary":"源日志未记录推理摘要", "risk_level":"unknown","relative_time_ms":None,"call_id":None,
             "source_ref":{"source_id":file_id,"record_index":index+1,"line_start":line,"source_path":path},"data_origin":"actual"}
         events.append(e);return e
     def call(source_id,name,args,path):
@@ -230,18 +384,30 @@ def normalize(record,file_id,index,raw,line,override):
             before = len(events)
             if m["role"]=="tool":result(m.get("tool_call_id"),content if isinstance(content,str) else dumps(content),f"messages[{j}]")
             else:
+                if m["role"] == "assistant":
+                    if pending: issues.append("call_unlinked")
+                    pending.clear()
                 if content is not None:event("message",m["role"],content if isinstance(content,str) else dumps(content),f"messages[{j}].content")
+                elif m["role"] == "assistant" and (m.get("reasoning_content") or m.get("reasoning")) and not m.get("tool_calls"):
+                    field = "reasoning_content" if m.get("reasoning_content") else "reasoning"
+                    event("message", "assistant", "", f"messages[{j}].{field}")
+                call_ids = [c.get("id") for c in (m.get("tool_calls") or [])]
+                duplicate_ids = {v for v in call_ids if call_ids.count(v) > 1}
                 for k,c in enumerate(m.get("tool_calls",[])):
                     fn=c.get("function",{});args=fn.get("arguments","{}")
                     try:json.loads(args) if isinstance(args,str) else None
                     except ValueError:issues.append("structure_invalid")
                     call(c.get("id"),fn.get("name"),args,f"messages[{j}].tool_calls[{k}]")
+                for duplicate_id in duplicate_ids:
+                    pending.pop(duplicate_id, None)
+                    issues.append("call_unlinked")
             for emitted in events[before:]:
                 reasoning = m.get("reasoning_content") or m.get("reasoning")
                 if isinstance(reasoning, str) and reasoning:
-                    emitted.update(reasoning_summary=reasoning, reasoning_provenance="source_log")
+                    emitted.update(reasoning_original=reasoning, reasoning_summary=reasoning, reasoning_provenance="source_log")
                 timestamp = m.get("ts_ms")
-                if type(timestamp) in {int, float} and timestamp >= 0:
+                if ((type(timestamp) is int and timestamp >= 0) or
+                        (type(timestamp) is float and math.isfinite(timestamp) and timestamp >= 0)):
                     emitted["relative_time_ms"] = timestamp
     if pending:issues.append("call_unlinked")
     metadata=record.get("metadata") if isinstance(record.get("metadata"),dict) else {}
@@ -261,6 +427,24 @@ def normalize(record,file_id,index,raw,line,override):
         "source":{"source_id":file_id,"format_code":fmt,"format_label":next(f["label"] for f in FORMATS if f["code"]==fmt)},
         "raw_text":raw,"issue_types":sorted(set(issues)),"source_ref":{"source_id":file_id,"record_index":index+1,"line_start":line,"source_path":"$"},
         "test_category":record.get("test_category") or metadata.get("test_category"),"inefficiency_groups":[],"data_origin":"actual"}
+    if competition is not None:
+        execution.update(original_sample_id=record["trajectory_id"], competition_report=competition,
+                         origin_type="external_import")
+        state = metadata.get("record") or {}
+        execution["session_completed"] = state.get("is_session_completed")
+        execution["task_status"] = "completed" if state.get("is_session_completed") is True else "unknown"
+        # Keep the original message and scoring-step coordinates alongside UI event IDs.
+        from app.services.agent_trace_competition import parse
+        scoring_calls, _, _, _, _, locations = parse(record)
+        for e in events:
+            path = e["source_ref"]["source_path"]
+            message_index = int(path.split("[")[1].split("]")[0])
+            e["source_ref"]["message_index"] = message_index
+            ids = locations.get(message_index, [])
+            if ".tool_calls[" in path:
+                call_index = int(path.split(".tool_calls[")[1].split("]")[0])
+                ids = [c["step_id"] for c in scoring_calls if c["message_index"] == message_index and c["call_index"] == call_index]
+            e["source_step_ids"] = ids
     language=record.get("language",metadata.get("language","unknown"))
     language=language if language in {"zh","en","other","unknown"} else "other"
     from app.services.agent_trace_audit import recorded_audit
@@ -293,7 +477,7 @@ def submit(db,body,user,key,name):
     def action():
         b=check_edit(db,bid)
         if body.get("expected_version")!=b.payload.get("batch_version",1):q.fail(409,"批次版本冲突")
-        all_files=bindings(db,bid)
+        all_files=bindings(db,bid,lock=True)
         explicit=body.get("file_ids")
         if explicit is not None and (not isinstance(explicit,list) or not explicit or len(explicit)>100 or not all(isinstance(i,str) for i in explicit)):q.fail(422,"file_ids无效")
         if explicit is not None and not set(explicit)<={f.file_id for f in all_files}:q.fail(409,"文件不属于批次")
@@ -343,7 +527,8 @@ def publish(db,batch,tid,parsed,selected_ids):
         for event in execution["events"]:
             event["risk_level"] = "unknown"
         source_evidence = recorded_audit(carried_row.result.get("source_record", {}), execution, execution["events"], execution["calls"])
-        audit_rows = audit_process(execution, execution["events"], execution["calls"], source_evidence)
+        audit_rows = audit_process(execution, execution["events"], execution["calls"], source_evidence,
+                                   record=carried_row.result.get("source_record", {}))
         current = db.scalar(select(TraceSample).where(TraceSample.snapshot_id==sid, TraceSample.trace_id==carried_row.trace_id))
         current.payload = {k:v for k,v in execution.items() if k not in {"events","calls"}}
         for model, field, identity in ((TraceEvent,"events","event_id"),(TraceCall,"calls","call_id")):
@@ -364,7 +549,7 @@ def publish(db,batch,tid,parsed,selected_ids):
         for e in events:
             e["risk_level"] = "unknown"
         audit_rows = recorded_audit(sample.get("source_record", {}), p, events, calls)
-        audit_rows = audit_process(p, events, calls, audit_rows)
+        audit_rows = audit_process(p, events, calls, audit_rows, record=sample.get("source_record", {}))
         validate_process(p,events,calls)
         db.add(TraceSample(id=stable_id("sample_",sid,trace),snapshot_id=sid,trace_id=trace,sample_id=str(p.get("original_sample_id") or sample["id"]),display_id=(str(p["original_sample_id"]) if p.get("original_sample_id") and len(str(p["original_sample_id"]))<=64 else f"AUD-{n+1:04}"),
             ingest_order=n,language=sample["language"],result={k:v for k,v in sample.items() if k!="execution"},payload=p))
@@ -512,7 +697,7 @@ def workspace(db,params,user):
         "summary":{"file_count":0,"supported_format_count":3,"imported_format_count":0,"parsed_trace_count":0,"failed_record_count":0,"category_mode":"single","by_language":[],"by_category":[],"by_format":[]},
         "validation":{"trace_total":0,"metrics":[{"code":c,"passed":0,"eligible":0,"missing":0,"failed":0,"not_applicable":0,"state":"not_applicable"} for c in ("structure","call_link","time","usage")],"can_continue":False,"blockers":["尚无有效轨迹"]},
         "issues":[],"sample_page":q.page([],1,20),"active_tasks":[],"export_options":{"scopes":["batch","filtered","sample"],"anonymize_required":True,
-            "contents":[{"code":c,"availability":"available"} for c in ("ingest_png","normalized_json","offline_html","evidence_index","manifest","error_report")]}}
+            "contents":[{"code":c,"availability":"available"} for c in ("normalized_json","offline_html","evidence_index","manifest","error_report")]}}
     if not batch:return output
     from app.repositories.task_repository import task_to_dict
     output["active_tasks"]=[task_to_dict(t) for t in db.scalars(select(Task).where(Task.capability_code.in_(["agent_trace_ingest","agent_trace_export"]),Task.status.in_(["pending","running"]),Task.input_data["batch_id"].as_string()==bid))]
@@ -534,7 +719,7 @@ def workspace(db,params,user):
     oq=params.get("option_q","").casefold()
     options_source=[s for s in options_source if oq in s["filename"].casefold()]
     output["source_options"]=q.page(options_source,q.number(params,"option_page",1,2147483647),50)
-    if not file_rows:
+    if not file_rows and batch.source_system != "upload":
         file_rows=[{"file_id":i,"filename":v.get("filename","价值分析记录"),"size_bytes":0,"detected_format":v.get("format_code"),"format_override":"auto","recognition_state":"recognized","parse_status":"succeeded",
             "parsed_trace_count":sum(r.payload["source"]["source_id"]==i for r in all_rows),"input_candidate_count":None,"failed_record_count":0,"error_examples":[]} for i,v in sources.items()]
     output["files"]=q.page(file_rows,q.number(params,"files_page",1,2147483647),20)

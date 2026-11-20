@@ -63,7 +63,7 @@ def validate_input(db, data, user):
     if data.get("view") != "tools":
         fail(422, "首版仅支持工具交互导出")
     kind = data.get("export_kind")
-    if (kind, data.get("format")) not in {("view", "png"), ("package", "zip")}:
+    if (kind, data.get("format")) not in {("view", "json"), ("package", "zip")}:
         fail(422, "导出类型或格式不支持")
     for key in ("batch_id", "snapshot_id", "projection_version", "selected_trace_id"):
         if not isinstance(data.get(key), str) or not data[key] or len(data[key]) > 64:
@@ -90,7 +90,7 @@ def validate_input(db, data, user):
     if event and not any(e["event_id"] == event for e in process_records(db, resolved, ids[0], TraceEvent)):
         fail(404, "导出事件不属于所选样本")
     contents = data.get("contents")
-    allowed = {"tools_png"} if kind == "view" else {"normalized_json", "evidence_index", "manifest"}
+    allowed = {"normalized_json"} if kind == "view" else {"normalized_json", "evidence_index", "manifest"}
     if not isinstance(contents, list) or not contents or any(not isinstance(c, str) or c not in allowed for c in contents):
         fail(422, "包含未支持的导出内容")
     if kind == "package" and "manifest" not in contents:
@@ -135,9 +135,9 @@ def create_task(db, data, user, key, name=None):
         return owner_task(db, existing.result["task_id"], user), False
 
 
-def anonymize(document, seed, sample):
+def anonymize(document, seed, sample=None):
     """One package-wide mapping; it is never included in the resulting files."""
-    identifiers = {sample.trace_id, sample.sample_id, sample.display_id}
+    identifiers = {sample.trace_id, sample.sample_id, sample.display_id} if sample else set()
     def collect(value):
         if isinstance(value, dict):
             for key, item in value.items():
@@ -170,40 +170,6 @@ def anonymize(document, seed, sample):
     return replace(redact(document, preserve_ids=True))
 
 
-def render_png(document):
-    from PIL import Image, ImageDraw, ImageFont
-    fonts = [os.getenv("AGENT_TRACE_FONT", ""), "C:/Windows/Fonts/msyh.ttc",
-             "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-             "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc"]
-    font_path = next((p for p in fonts if p and Path(p).is_file()), None)
-    if not font_path:
-        raise ValueError("PNG 中文字体不可用，请配置 AGENT_TRACE_FONT")
-    font, title_font = ImageFont.truetype(font_path, 18), ImageFont.truetype(font_path, 28)
-    calls = document["calls"]
-    width, height = 1500, 260 + max(1, len(calls)) * 180
-    if height > 60000:
-        raise ValueError("调用过多无法生成 PNG，请导出 ZIP")
-    img = Image.new("RGB", (width, height), "#f3f7ff")
-    draw = ImageDraw.Draw(img)
-    draw.text((30, 20), "智能体轨迹审计 · 工具交互", font=title_font, fill="#17365e")
-    draw.text((30, 70), "价值分析 · 含模拟过程（按固定快照生成，非浏览器截图）", font=font, fill="#ad5e00")
-    draw.text((30, 110), f"样本 {document['sample']['trace_id']} | 调用 {len(calls)} | 来源 {document['sample']['source']['format_label']}", font=font, fill="#17365e")
-    y = 180
-    for c in calls:
-        draw.rounded_rectangle((25, y, width - 25, y + 160), radius=8, outline="#aac5ee", fill="white")
-        lines = [f"{c['display_id']}  {c['tool_name']}  {c['execution_status']}  {c.get('duration_ms')} ms",
-                 f"权限：{c['permission_decision']} | 结果：{c['result_code']}",
-                 "请求：" + c["input_json"], "返回：" + c["output_json"]]
-        for j, line in enumerate(lines):
-            draw.text((40, y + 12 + j * 34), line[:100], font=font, fill="#17365e")
-        y += 180
-    if not calls:
-        draw.text((40, y), "该样本没有工具调用", font=font, fill="#17365e")
-    output = io.BytesIO()
-    img.save(output, format="PNG")
-    return output.getvalue()
-
-
 def build_artifact(db, task):
     if task.input_data.get("view") != "tools":
         from app.services.agent_trace_reports import build
@@ -220,7 +186,7 @@ def build_artifact(db, task):
             TraceEvidence.projection_version == scope["projection_version"]))]}
     document = anonymize(document, task.task_id, sample)
     if data["export_kind"] == "view":
-        return render_png(document), "agent-trace-tools.png", "image/png"
+        return dumps(document).encode(), "agent-trace-tools.json", "application/json"
     contents = set(data["contents"])
     files = {}
     if "normalized_json" in contents:
@@ -257,7 +223,7 @@ def run_export(task_id, sessions=SessionLocal):
             validate_input(db, task.input_data, user)
             body, filename, mime = build_artifact(db, task)
             aid = "art_" + uuid4().hex
-            storage_name = aid + (".png" if mime == "image/png" else ".json" if mime == "application/json" else ".zip")
+            storage_name = aid + (".json" if mime == "application/json" else ".zip")
             target = directory() / storage_name
             temporary = target.with_suffix(".tmp")
             temporary.write_bytes(body)
@@ -276,7 +242,7 @@ def run_export(task_id, sessions=SessionLocal):
             db.rollback()
             task = db.get(Task, task_id)
             task.status, task.finished_at = "failed", now_shanghai()
-            message = str(exc.detail) if isinstance(exc, HTTPException) else str(exc) if isinstance(exc, ValueError) else "导出文件生成失败，请检查存储和字体配置"
+            message = str(exc.detail) if isinstance(exc, HTTPException) else str(exc) if isinstance(exc, ValueError) else "导出文件生成失败，请检查存储配置"
             task.result = {**task.result, "error_message": message, "artifacts": []}
             db.commit()
 

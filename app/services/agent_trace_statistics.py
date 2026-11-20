@@ -104,8 +104,10 @@ def summary(s, st, scope, user):
         "test_category_label": dict(CATEGORIES).get(v["test_category"], "未知"), "token_usage": v["token_usage"],
         "event_count": p["event_count"], "call_count": p["call_count"], "retry_count": p.get("retry_count", 0),
         "duration_ms": p.get("duration_ms"), "task_status": v["task_status"], "audit_decision": v["audit_decision"],
+        "risk_level": p.get("risk_level", "unknown"), "risk_types": p.get("risk_types", []),
+        "risk_steps": p.get("risk_steps", []), "first_risk_step": p.get("first_risk_step"),
         "missing_fields": v["missing_fields"], "availability": v["availability"], "ingest_order": s.ingest_order,
-        "data_origin": v["data_origin"], "actual_audit_decision": v["actual_audit_decision"], "rule_audit": p.get("rule_audit"), "rule_findings": q.redact(p.get("rule_findings", []), preserve_ids=True),
+        "data_origin": v["data_origin"], "actual_audit_decision": v["actual_audit_decision"], **q.rule_audit_projection(p),
         "allowed_actions": {"view_detail": True, "copy_json": True, "export_json": q.permissions(user)["can_export"]}}
 
 
@@ -244,8 +246,8 @@ def workspace(db, params, user):
             *[{"code":l,"label":l,"count":n} for l,n in db.execute(select(TraceSample.language,func.count()).where(TraceSample.snapshot_id==scope["snapshot_id"]).group_by(TraceSample.language))]],
         "sample_page":sample_page,"list_context":sample_page["context"],
         "permissions":{"can_view_statistics":True,"can_list_samples":True,"can_view_detail":True,"can_view_raw":perms["can_view_raw"],"can_copy_json":True,"can_export":perms["can_export"]},
-        "export_options":{"kinds":[{"export_kind":k,"formats":[f],"availability":"available"} for k,f in (("view","png"),("package","zip"),("sample_json","json"))],
-            "contents":[{"code":c,"label":c,"availability":"available"} for c in ("statistics_png","stats_summary","sample_table","normalized_json","manifest")],
+        "export_options":{"kinds":[{"export_kind":k,"formats":f,"availability":"available"} for k,f in (("view",["json"]),("package",["zip"]),("sample_json",["json"]))],
+            "contents":[{"code":c,"label":c,"availability":"available"} for c in ("stats_summary","sample_table","normalized_json","manifest")],
             "required_contents":["manifest"],"redaction_profiles":["standard"],"default_scope":"filtered","max_selected_trace_ids":100},
         "module_availability":{v:{"availability":"available"} for v in ("ingest","statistics","execution","tools")},
         "warnings": ([{"code":"mixed_display_data","message":"含模拟过程及默认展示指标；并非实际风险检测结论。","panel":"all"}] if any(s.payload.get("data_origin") != "actual" for s, _ in rows(db, scope, params)) else [])}

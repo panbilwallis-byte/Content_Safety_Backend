@@ -4,6 +4,7 @@ from copy import deepcopy
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import time
@@ -197,14 +198,34 @@ def get_sample(db, scope, trace):
     return row
 
 
+def rule_audit_projection(payload):
+    """Describe result availability without changing the published audit facts."""
+    raw_audit = payload.get("rule_audit")
+    audit = deepcopy(raw_audit) if isinstance(raw_audit, dict) else {}
+    findings = payload.get("rule_findings")
+    count = None
+    if audit.get("status") == "completed" and isinstance(findings, list):
+        count = len(findings)
+        state = "completed_findings" if count else "completed_empty"
+        message = f"审计完成，发现 {count} 项" if count else "审计完成，未发现命中项"
+    elif audit.get("status") in ("pending", "queued", "running"):
+        state, message = "pending", "等待审计"
+    else:
+        state, message = "missing", "审计结果缺失"
+    audit.update(result_state=state, finding_count=count, display_message=message)
+    return {"rule_audit": audit,
+            "rule_findings": redact(findings if isinstance(findings, list) else [], preserve_ids=True)}
+
+
 def sample_summary(row):
     p = row.payload
     return {"trace_id": row.trace_id, "display_id": row.display_id, "language": row.language,
             "event_count": p["event_count"], "call_count": p["call_count"], "duration_ms": p.get("duration_ms"),
             "risk_level": p.get("risk_level", "unknown"), "audit_decision": p.get("audit_decision", "unknown"),
+            "risk_steps": p.get("risk_steps", []), "first_risk_step": p.get("first_risk_step"),
             "risk_types": p.get("risk_types", []), "ingest_order": row.ingest_order,
             "data_origin": p["data_origin"], "sample_id": row.sample_id, "original_sample_id": p.get("original_sample_id", row.sample_id),
-            "source_id": p["source"]["source_id"], "test_category": p.get("test_category"), "rule_audit": p.get("rule_audit"), "rule_findings": redact(p.get("rule_findings", []), preserve_ids=True)}
+            "source_id": p["source"]["source_id"], "test_category": p.get("test_category"), **rule_audit_projection(p)}
 
 
 def sample_statement(scope, params):
@@ -307,6 +328,13 @@ def workspace(db, params, view, user):
     count = db.scalar(select(func.count()).select_from(TraceSample).where(TraceSample.snapshot_id == scope["snapshot_id"]))
     langs = db.execute(select(TraceSample.language, func.count()).where(TraceSample.snapshot_id == scope["snapshot_id"])
                       .group_by(TraceSample.language)).all()
+    if view == "execution":
+        name = func.coalesce(func.nullif(func.trim(TraceCall.payload["tool_name"].as_string()), ""), "unknown")
+        groups = db.execute(select(name, func.count()).where(
+            TraceCall.snapshot_id == scope["snapshot_id"]).group_by(name)).all()
+        items = sorted(({"tool_name": n, "call_count": c} for n, c in groups),
+                       key=lambda item: (-item["call_count"], item["tool_name"]))
+        output["tool_call_summary"] = {"total_call_count": sum(item["call_count"] for item in items), "items": items}
     return {**output, "scope": {**scope, "permissions_version": "platform-v1", "schema_version": "1", "policy_version": scope["projection_version"]},
         "active_snapshot_id": target.active_snapshot_id, "batch_summary": {"sample_count": count, "by_language": [{"code": l, "label": l, "count": c} for l, c in langs]},
         "sample_page": sp, "list_context": sp["context"], "selected_trace_id": selection or (sp["items"][0]["trace_id"] if sp["items"] else None),
@@ -393,43 +421,120 @@ def tool_detail(db, batch, scope, trace, params, user):
     return {**common, "summary": {"batch_display_id": batch.display_id, "batch_name": batch.payload.get("name"), "trace_display_id": sample.display_id,
             "language": sample.language, "test_category": sample.payload.get("test_category"),
             "risk_level": sample.payload.get("risk_level", "unknown"), "event_count": sample.payload["event_count"],
+            "audit_decision": sample.payload.get("audit_decision", "unknown"),
+            "risk_steps": sample.payload.get("risk_steps", []), "first_risk_step": sample.payload.get("first_risk_step"),
             "source": sample.payload["source"]},
         "metrics": {"call_count": len(calls), "tool_kind_count": len({c.get("tool_id", c["tool_name"]) for c in calls}),
             "success_count": counts["succeeded"], "error_count": counts["failed"],
             "not_executed_count": counts["not_executed"], "unknown_status_count": counts["unknown"],
             "overreach_count": sum(any(t["code"] == "overreach" for t in c["behavior_tags"]) for c in calls),
             "inefficient_count": sum(any(t["code"] == "inefficient" for t in c["behavior_tags"]) for c in calls)},
-        "rule_findings": redact(sample.payload.get("rule_findings", []), preserve_ids=True), "rule_audit": sample.payload.get("rule_audit"),
+        **rule_audit_projection(sample.payload),
         "timing": timing(sample.payload, calls), "sequence": sequence, "calls": calls_page, "selection": selected,
         "sample_analysis": {"inefficiency_groups": sample.payload.get("inefficiency_groups", [])},
         "permissions": permissions(user), "data_origin": sample.payload["data_origin"],
         "warnings": [{"code": "generated_process", "message": "含模拟过程，不是实际风险审计证据"}] if sample.payload["data_origin"] != "actual" else []}
 
 
+def recorded_event_text(event):
+    """Full recorded content only; display descriptions are never source text."""
+    if event.get("data_origin") == "generated":
+        return None
+    path = (event.get("source_ref") or {}).get("source_path", "")
+    if path.endswith((".reasoning_content", ".reasoning")):
+        reasoning = event.get("reasoning_summary")
+        return reasoning if event.get("reasoning_provenance") == "source_log" and isinstance(reasoning, str) else None
+    original = event.get("source_excerpt")
+    return original if isinstance(original, str) else None
+
+
+def original_reasoning(event):
+    """Only recorded reasoning qualifies; generated summaries are never originals."""
+    placeholders = {"源日志未记录推理摘要", "未提供思考原文", "未提供推理原文",
+                    "模拟审计摘要，仅用于展示执行过程，不是模型原始推理。"}
+    def supplied(value):
+        return isinstance(value, str) and bool(value.strip()) and value.strip() not in placeholders
+    text = None
+    if event.get("data_origin") != "generated":
+        text = event.get("reasoning_original")
+        if not supplied(text):
+            text = event.get("reasoning_summary") if event.get("reasoning_provenance") == "source_log" else None
+        if not supplied(text) and event.get("data_origin") == "actual" and event.get("event_type") == "thought":
+            text = event.get("source_excerpt")
+    provided = supplied(text)
+    return {"text": text if provided else "", "highlights": [], "truncated": False,
+            "provenance": "source_log" if provided else "not_provided"}
+
+
+def execution_evidence(scope, trace, events, event_id, mode):
+    index = next(i for i, event in enumerate(events) if event["event_id"] == event_id)
+    event = events[index]
+    original = recorded_event_text(event)
+    if original is None:
+        fail(404, "该事件未保存完整原文，无法获取原文证据")
+    location = deepcopy(event.get("source_ref") or {})
+    parts = [str(location[k]) for k in ("source_id",) if location.get(k)]
+    if location.get("record_index") is not None:
+        parts.append(f"记录 {location['record_index']}")
+    if location.get("source_path"):
+        parts.append(str(location["source_path"]))
+    if location.get("line_start") is not None:
+        line = str(location["line_start"])
+        if location.get("line_end") is not None and location["line_end"] != location["line_start"]:
+            line += "–" + str(location["line_end"])
+        parts.append("行 " + line)
+    result = {"view": "execution", "section": "evidence",
+        "scope": {**scope, "permissions_version": "platform-v1"},
+        "trace_id": trace, "event_id": event_id, "source_ref": " · ".join(parts) or None,
+        "source_location": location,
+        "before_text": (recorded_event_text(events[index - 1]) or "") if index else "",
+        "original_text": original,
+        "after_text": (recorded_event_text(events[index + 1]) or "") if index + 1 < len(events) else "",
+        "complete": True, "redaction_mode": mode}
+    return result if mode == "raw" else redact(result, preserve_ids=True)
+
+
 def execution_detail(db, scope, trace, params, user):
     sample = get_sample(db, scope, trace)
     section = params.get("section", "overview")
-    if section not in {"overview", "events", "selection", "graph"}:
+    if section not in {"overview", "events", "selection", "graph", "evidence"}:
         fail(422, "执行路径 section 无效")
     mode = params.get("redaction_mode", "redacted")
     if mode not in {"raw", "redacted"}:
         fail(422, "脱敏模式无效")
     if mode == "raw" and not permissions(user)["can_view_raw"]:
         fail(403, "没有原文查看权限")
+    if params.get("permissions_version", "platform-v1") != "platform-v1":
+        fail(409, "权限版本已变更，请重新查询")
     events = process_records(db, scope, trace, TraceEvent)
+    for event in events:
+        original = recorded_event_text(event)
+        if isinstance(original, str) and len(original) > 512 and event.get("description") == original[:512]:
+            event["description"] = original
+        value = event.get("relative_time_ms")
+        if not ((type(value) is int and value >= 0) or
+                (type(value) is float and math.isfinite(value) and value >= 0)):
+            event["relative_time_ms"] = None
+    has_event_time = any(e.get("relative_time_ms") is not None for e in events)
+    eid = params.get("event_id")
+    if eid and not any(e["event_id"] == eid for e in events):
+        fail(404, "事件不属于当前样本")
+    if section in {"selection", "evidence"} and not eid:
+        fail(422, "事件详情必须提供 event_id")
+    if section == "evidence":
+        return execution_evidence(scope, trace, events, eid, mode)
     if mode != "raw":
         events = redact(events, preserve_ids=True)
     evidence = [deepcopy(e.payload) for e in db.scalars(select(TraceEvidence).where(
         TraceEvidence.snapshot_id == scope["snapshot_id"], TraceEvidence.trace_id == trace,
-        TraceEvidence.projection_version == scope["projection_version"])) if e.payload.get("review_status") != "dismissed"]
+        TraceEvidence.projection_version == scope["projection_version"]).order_by(TraceEvidence.id)) if e.payload.get("review_status") != "dismissed"]
     if mode != "raw":
         evidence = redact(evidence,preserve_ids=True)
-    first_risk = next((e["event_id"] for e in events if any(x["event_id"] == e["event_id"] for x in evidence)), None)
-    eid = params.get("event_id")
-    if eid and not any(e["event_id"] == eid for e in events):
-        fail(404, "事件不属于当前样本")
-    if section == "selection" and not eid:
-        fail(422, "事件详情必须提供 event_id")
+    evidence_by_event = {}
+    for item in evidence:
+        evidence_by_event.setdefault(item["event_id"], []).append(item)
+    risk_event_ids = set(evidence_by_event)
+    first_risk = next((e["event_id"] for e in events if e["event_id"] in risk_event_ids), None)
     size = number(params, "event_page_size", 50)
     num = number(params, "event_page", 1, 2_147_483_647)
     if eid:
@@ -440,10 +545,21 @@ def execution_detail(db, scope, trace, params, user):
     elif events[(num - 1) * size:num * size]:
         eid = events[(num - 1) * size]["event_id"]
     event_positions={e["event_id"]:i for i,e in enumerate(events)}
+    def risk_fields(event):
+        items = evidence_by_event.get(event["event_id"], [])
+        levels = {x.get("severity") for x in items}
+        summaries = []
+        for item in items:
+            label = str(item.get("risk_type", {}).get("label") or item.get("rule_id") or "风险证据")
+            quote = item.get("match_pattern")
+            summaries.append(label + ("：" + quote if isinstance(quote, str) and quote else ""))
+        return {"has_risk": bool(items),
+                "risk_level": next((s for s in ("high", "medium", "low") if s in levels), "unknown" if items else "none"),
+                "evidence_summary": "\n".join(dict.fromkeys(summaries))}
     def selection(event, units=16384):
         idx = event_positions[event["event_id"]]
-        items = [x for x in evidence if x["event_id"] == event["event_id"]]
-        content_version=hashlib.sha256(dumps([scope,trace,event["event_id"],mode,str(user["uid"]),event.get("source_excerpt"),event.get("reasoning_summary")]).encode()).hexdigest()
+        items = evidence_by_event.get(event["event_id"], [])
+        content_version=hashlib.sha256(dumps([scope,trace,event["event_id"],mode,str(user["uid"]),event.get("source_excerpt"),event.get("reasoning_summary"),event.get("reasoning_original")]).encode()).hexdigest()
         texts={}
         for field in ("source_excerpt","reasoning_summary"):
             text=text_preview(event.get(field,""),units)
@@ -451,12 +567,14 @@ def execution_detail(db, scope, trace, params, user):
             text["next_cursor"]=cursor(scope,trace,"selection:"+event["event_id"]+":"+content_version+":"+field,text["loaded_units"],user) if text["truncated"] else None
             texts[field]=text
         texts["reasoning_summary"]["provenance"]=event.get("reasoning_provenance", "derived_summary")
+        texts["reasoning_original"] = original_reasoning(event)
         references=event.get("source_ref") or {}
         lineage_nodes=[]
         if references.get("source_id"):
             lineage_nodes.append({"id":references["source_id"],"kind":"source","label":"来源记录","event_id":None,"source_ref":references})
         lineage_nodes.append({"id":event["event_id"],"kind":"event","event_id":event["event_id"],"label":event["label"]})
         return {"event_id": event["event_id"], "display_id": event["display_id"], "ordinal": event["ordinal"],
+            **risk_fields(event),
             "graph_locator":{"cursor":cursor(scope,trace,"graph",idx//500*500,user) if idx>=500 else None},
             "previous_event_id": events[idx - 1]["event_id"] if idx else None,
             "next_event_id": events[idx + 1]["event_id"] if idx + 1 < len(events) else None,
@@ -465,12 +583,13 @@ def execution_detail(db, scope, trace, params, user):
             "risk_evidence": {"items": items, "total": len(items)},
             "lineage": {"nodes":lineage_nodes,"total_nodes":len(lineage_nodes),"complete":True,"unresolved_refs":[],"next_cursor":None,
                         "edges": [{"from_id":references["source_id"],"to_id":event["event_id"],"relation":"source_reference"}] if references.get("source_id") else [], "availability": "available"}}
-    rendered = [{**{k: v for k, v in e.items() if k not in {"source_excerpt", "reasoning_summary"}},
+    rendered = [{**{k: v for k, v in e.items() if k not in {"source_excerpt", "reasoning_summary", "reasoning_original"}},
+                 **risk_fields(e),
                  "selection_preview": selection(e, 4096)} for e in events]
     sp = page(rendered, num, size)
     selected = next((selection(e) for e in events if e["event_id"] == eid), None)
     common = {"view": "execution", "section": section, "scope": {**scope, "permissions_version": "platform-v1"},
-              "trace_id": trace, "first_risk_event_id": first_risk}
+              "trace_id": trace, "first_risk_event_id": first_risk, "has_event_time": has_event_time}
     if params.get("selection_cursor"):
         if section!="selection" or not selected:fail(422,"长内容游标要求selection和event_id")
         token=unsign(params["selection_cursor"])
@@ -495,7 +614,8 @@ def execution_detail(db, scope, trace, params, user):
     edges = [r.payload for r in db.scalars(select(TraceRelation).where(TraceRelation.snapshot_id == scope["snapshot_id"],
         TraceRelation.trace_id == trace)) if {r.payload["from_event_id"], r.payload["to_event_id"]} <= ids
         and not {r.payload["from_event_id"], r.payload["to_event_id"]} <= previous]
-    graph = {"nodes": [{k: e[k] for k in ("event_id", "display_id", "ordinal", "label", "risk_level")} for e in events[start:end]],
+    graph = {"nodes": [{**{k: e[k] for k in ("event_id", "display_id", "ordinal", "label")},
+                        "risk_level": risk_fields(e)["risk_level"]} for e in events[start:end]],
              "edges": edges, "total_nodes": len(events), "loaded_nodes": end, "complete": end >= len(events),
              "next_cursor": cursor(scope, trace, "graph", end, user) if end < len(events) else None}
     if section == "graph":
@@ -508,5 +628,5 @@ def execution_detail(db, scope, trace, params, user):
             "event_count": len({e["event_id"] for e in evidence if e["risk_type"]["code"] == code})} for code in sorted({e["risk_type"]["code"] for e in evidence})],
                               "availability": "partial" if evidence else "unavailable"},
         "danger_patterns": page(patterns, number(params, "pattern_page", 1, 2_147_483_647), 20),
-        "rule_findings": redact(sample.payload.get("rule_findings", []), preserve_ids=True), "rule_audit": sample.payload.get("rule_audit"),
+        **rule_audit_projection(sample.payload),
         "permissions": permissions(user), "data_origin": sample.payload["data_origin"]}

@@ -330,6 +330,33 @@ curl http://127.0.0.1:8000/health
 
 ## 常见启动问题
 
+### 旧版 dataset_versions 缺少 version_id
+
+如果启动报 `Unknown column 'dataset_versions.version_id'`，且旧表使用
+`id/dataset_id/version/source_version/task_id/samples/created_at`，其中 `samples`
+是 JSON 对象列表，可使用专用迁移脚本。执行前停止所有写入该库的服务和任务；
+此脚本不通过启动应用执行，不会顺带运行其他初始化逻辑。
+
+```bash
+cd /root/yjp/Content_Safety_Backend
+uv run python scripts/migrate_legacy_dataset_versions.py
+uv run python scripts/migrate_legacy_dataset_versions.py --apply
+```
+
+第一条仅检查，确认目标库和版本/样本数量正确后再执行第二条。
+脚本会为 `dataset_versions`、`dataset_version_items`、`dataset_records` 创建带时间戳的库内备份表，
+保留旧版本列，将旧快照原文追加到样本表，并登记新版版本清单、清单哈希及父版本引用。
+不会将 `record-1` 直接猜测为数据库记录 1，也不会覆盖已有样本。
+因此迁移后 `dataset_records` 记录数会增加，版本条数和各版本快照内容应保持一致。
+此备份在同一个数据库内，不替代独立的完整数据库备份。
+
+MySQL DDL 不能整体事务回滚；数据转换和校验使用独立事务，失败时不要删表，
+保留脚本输出的备份表名和错误信息进行排查。脚本遇到已填充的新版版本 ID 会停止重复迁移。
+此方案保留旧自增主键，通过唯一索引保证新版 `version_id` 唯一，属于兼容性迁移。
+隔离测试验证了快照和版本关系转换，未代替目标服务器上的 MySQL 恢复演练。
+
+迁移成功后，按前述启动命令重启后端，并检查 `/health` 以及历史版本内容。
+
 - `Unknown database`：目标数据库尚未创建，先建库；程序只自动建表。
 - `Access denied`：核对账号、密码、账号 Host 和授权，启动需要 DDL 与写入权限。
 - `Unknown column` 或迁移报错：旧表结构可能超出兼容范围，按日志核对具体表结构，不能仅靠 `create_all()` 修复。

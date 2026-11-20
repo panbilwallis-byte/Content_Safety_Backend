@@ -4,8 +4,6 @@ import hashlib
 import html
 import io
 import json
-import os
-from pathlib import Path
 import zipfile
 
 from sqlalchemy import select
@@ -39,7 +37,7 @@ def validate(db,data,user):
     view=data.get("view")
     if view not in {"ingest","statistics","execution"}:q.fail(422,"轨迹导出视图无效")
     kind=data.get("export_kind")
-    if (kind,data.get("format")) not in {("view","png"),("package","zip"),("sample_json","json")}:
+    if (kind,data.get("format")) not in {("view","json"),("package","zip"),("sample_json","json")}:
         q.fail(422,"导出类型或格式不支持")
     if kind=="sample_json" and view!="statistics":q.fail(422,"此视图不支持单样本JSON导出")
     for key in ("batch_id","snapshot_id"):
@@ -52,7 +50,7 @@ def validate(db,data,user):
     if kind=="sample_json" and spec["type"]!="sample":q.fail(422,"完整样本JSON要求sample范围")
     if data.get("redaction_profile","standard")!="standard" or data.get("anonymize_ids",True) is not True:q.fail(422,"要求standard脱敏和匿名化")
     contents=data.get("contents")
-    allowed={view+"_png"} if kind=="view" else {"normalized_json"} if kind=="sample_json" else {
+    allowed={"normalized_json"} if kind in {"view","sample_json"} else {
         "normalized_json","evidence_index","manifest","offline_html","error_report", "stats_summary","sample_table"}
     if not isinstance(contents,list) or not contents or any(not isinstance(c,str) or c not in allowed for c in contents):q.fail(422,"不支持的导出内容")
     if kind=="package" and "manifest" not in contents:q.fail(422,"ZIP必须包含manifest")
@@ -74,28 +72,6 @@ def validate(db,data,user):
     return frozen
 
 
-def png(document,view):
-    from PIL import Image,ImageDraw,ImageFont
-    candidates=[os.getenv("AGENT_TRACE_FONT",""),"C:/Windows/Fonts/msyh.ttc","/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc","/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc"]
-    font=next((v for v in candidates if v and Path(v).is_file()),None)
-    if not font:raise ValueError("PNG中文字体不可用，请配置AGENT_TRACE_FONT")
-    body=ImageFont.truetype(font,20);title=ImageFont.truetype(font,30)
-    labels={"ingest":"轨迹接入与校验","statistics":"统计指标","execution":"思维路径"}
-    lines=[("智能体轨迹审计 · "+labels[view],True), ("固定快照报告；含默认展示数据时不作为实际风险审计结论",False),
-           ("批次样本总数："+str(document.get("context_sample_count",len(document["samples"])))+"；当前明细范围："+str(len(document["samples"])),False)]
-    if view=="statistics":
-        for key,value in document["statistics"]["kpis"].items():lines.append((f"{key}: {value['value']} {value['unit']}",False))
-    for sample in document["samples"][:100]:
-        lines.append((sample["summary"]["display_id"]+" / "+sample["summary"]["language"]+" / "+sample["data_origin"],False))
-        if view=="execution":
-            lines.extend((f"{e['display_id']} {e['label']}  {e.get('relative_time_ms')} ms",False) for e in sample["events"][:100])
-        elif view=="ingest":lines.append(("事件："+str(len(sample["events"]))+"；工具调用："+str(len(sample["calls"])),False))
-    if len(document["samples"])>100:lines.append(("报告图片仅列前100个样本，完整明细见结果包",False))
-    image=Image.new("RGB",(1500,max(300,55*len(lines)+50)),"#f3f7ff");draw=ImageDraw.Draw(image)
-    for index,(line,is_title) in enumerate(lines):draw.text((30,25+55*index),line[:110],font=title if is_title else body,fill="#17365e")
-    out=io.BytesIO();image.save(out,"PNG");return out.getvalue()
-
-
 def build(db,task):
     from app.services.agent_trace_export import anonymize
     data=task.input_data;_,scope=q.resolve(db,data["batch_id"],data)
@@ -108,12 +84,12 @@ def build(db,task):
               "requested_scope":data["scope"],"notice":"含模拟过程或默认展示数据时，不作为真实审计结论"}
     for row in rows:
         value=stats.normalized(db,scope,row)
-        document["samples"].append({**value,"summary":q.sample_summary(row),"data_origin":row.payload.get("data_origin","actual"), "rule_audit":row.payload.get("rule_audit"), "rule_findings":row.payload.get("rule_findings",[])})
+        document["samples"].append({**value,"summary":q.sample_summary(row),"data_origin":row.payload.get("data_origin","actual"), **q.rule_audit_projection(row.payload)})
     if data["view"]=="statistics":document["statistics"]=stats.aggregate(db,scope,{"language":data["scope"].get("language",data.get("language","all"))},{"uid":task.config["owner_id"]})
     document["errors"]=[b.payload.get("error_examples",[]) for b in db.scalars(select(TraceBinding).where(TraceBinding.batch_id==scope["batch_id"]))]
-    if rows:document=anonymize(document,task.task_id,rows[0])
-    else:document=q.redact(document,preserve_ids=True)
-    if data["export_kind"]=="view":return png(document,data["view"]),"agent-trace-"+data["view"]+".png","image/png"
+    document=anonymize(document,task.task_id,rows[0] if rows else None)
+    if data["export_kind"]=="view":
+        return dumps(document).encode(),"agent-trace-"+data["view"]+".json","application/json"
     if data["export_kind"]=="sample_json":return dumps(document["samples"][0]).encode(),"agent-trace-sample.json","application/json"
     files={};contents=set(data["contents"])
     if "normalized_json" in contents:files["normalized.json"]=dumps(document).encode()

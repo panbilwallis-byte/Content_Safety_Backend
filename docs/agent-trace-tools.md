@@ -2,6 +2,7 @@
 
 本文件记录工具页首版实现。后续已增加接入解析、统计指标及完整思维路径读取，
 新增能力与联调记录见 [三页后端接入说明](agent-trace-pages.md)。下文“仅工具页”等范围描述为首版历史记录。
+当前轨迹审计仅提供 JSON 和 ZIP 导出，PNG 导出已移除；下文截图及历史联调记录不代表当前导出格式。
 只修改本后端；价值分析服务和 Vue 项目保持不变。
 
 ## 启动与来源
@@ -23,8 +24,6 @@
 LLM_ACCESS_TOKEN=填写已授权令牌
 # 仅在模型服务结果不在业务 MySQL 时设置；账号只需 SELECT 权限
 # AGENT_TRACE_LLM_DATABASE_URL=mysql+pymysql://USER:PASSWORD@HOST:3306/DATABASE?charset=utf8mb4
-# PNG 字体；Windows 自动寻找微软雅黑，Linux 自动寻找 Noto CJK/WenQuanYi
-# AGENT_TRACE_FONT=/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc
 # AGENT_TRACE_ARTIFACT_DIR=storage/agent-trace-artifacts
 ```
 
@@ -73,7 +72,7 @@ overview 和显式 sequence 均接受 sequence_cursor；游标签名并绑定操
 scope.type=sample 且一个 trace_id。写入必须提供 X-Request-Id：同键同内容返回原任务，
 同键不同内容返回409，至少保留24小时，命中也重新鉴权。
 
-- `export_kind=view, format=png, contents=[tools_png]`：真实 PNG 规范报告，需要中文字体。
+- `export_kind=view, format=json, contents=[normalized_json]`：当前视图 JSON，无需字体配置。
 - `export_kind=package, format=zip`：支持 normalized_json、evidence_index、manifest，manifest 必选。
 - 强制 standard 脱敏和包内一致匿名化；原始日志不作为独立文件导出。
 - 通过 `GET /tasks/{task_id}` 查询，文件已落盘才能 succeeded；失败提供 error_message。

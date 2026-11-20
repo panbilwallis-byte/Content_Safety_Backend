@@ -10,7 +10,6 @@ import zipfile
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
-from PIL import Image
 from sqlalchemy import create_engine, func, select, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -285,7 +284,7 @@ def test_timing_parallel_and_incomplete():
     assert query.timing({"duration_ms": 400}, calls)["other_duration_ms"] is None
 
 
-@pytest.mark.parametrize("kind,format,contents", [("view", "png", ["tools_png"]), ("package", "zip", ["normalized_json", "evidence_index", "manifest"])])
+@pytest.mark.parametrize("kind,format,contents", [("view", "json", ["normalized_json"]), ("package", "zip", ["normalized_json", "evidence_index", "manifest"])])
 def test_real_export_ticket_file_and_idempotency(env, kind, format, contents):
     client = env["client"]
     payload = command(env, export_kind=kind, format=format, contents=contents)
@@ -307,9 +306,9 @@ def test_real_export_ticket_file_and_idempotency(env, kind, format, contents):
     file = client.get(ticket["download_url"], headers={"Authorization": ""})
     assert file.status_code == 200
     assert hashlib.sha256(file.content).hexdigest() == artifact["sha256"]
-    if format == "png":
-        image = Image.open(io.BytesIO(file.content))
-        assert image.format == "PNG" and image.width == 1500
+    if format == "json":
+        assert len(file.json()["calls"]) == 7
+        assert artifact["mime_type"] == "application/json"
     else:
         with zipfile.ZipFile(io.BytesIO(file.content)) as archive:
             manifest = json.loads(archive.read("manifest.json"))
@@ -339,16 +338,16 @@ def test_export_validation_and_expired_ticket(env):
     assert client.get(ROOT + "/downloads", params={"t": token}, headers={"Authorization": ""}).status_code == 410
 
 
-def test_failed_font_export_and_expired_artifact(env, monkeypatch):
-    def no_font(document):
-        raise ValueError("测试字体不可用")
-    monkeypatch.setattr(exports, "render_png", no_font)
+def test_failed_file_export(env, monkeypatch):
+    def unavailable_storage():
+        raise ValueError("测试存储不可用")
+    monkeypatch.setattr(exports, "directory", unavailable_storage)
     client = env["client"]
-    tid = client.post("/api/v1/tasks/execute", json=command(env, export_kind="view", format="png", contents=["tools_png"]),
-        headers={"X-Request-Id": "font"}).json()["data"]["task_id"]
+    tid = client.post("/api/v1/tasks/execute", json=command(env, export_kind="view", format="json", contents=["normalized_json"]),
+        headers={"X-Request-Id": "storage"}).json()["data"]["task_id"]
     task = client.get("/api/v1/tasks/" + tid).json()["data"]
     assert task["status"] == "failed" and not task["result"]["artifacts"]
-    assert "字体" in task["error_message"]
+    assert "存储" in task["error_message"]
 
 
 def test_content_bounds_unicode_and_original_json_keys(env):

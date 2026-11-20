@@ -1,6 +1,7 @@
 """Adapter for the external agent's events/tool_events JSONL contract."""
 from copy import deepcopy
 import json
+import math
 
 CODE = "agent_trajectory"
 LABEL = "智能体轨迹 JSONL"
@@ -20,7 +21,8 @@ EXAMPLE = {
 
 
 def number(value):
-    return value if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0 else None
+    return value if ((type(value) is int and value >= 0) or
+                     (type(value) is float and math.isfinite(value) and value >= 0)) else None
 
 
 def normalize_trajectory(record, file_id, index, raw, line, normalize):
@@ -90,6 +92,11 @@ def normalize_trajectory(record, file_id, index, raw, line, normalize):
     call_by_key = {}
     labels = {"user": "用户输入", "thought": "已记录推理", "tool_call": "工具调用", "tool_result": "工具返回", "final": "最终回答", "error": "运行错误", "system": "系统消息"}
     for j, (source, target) in enumerate(zip(events, execution["events"])):
+        reasoning = source.get("reasoning")
+        if not isinstance(reasoning, str) or not reasoning.strip():
+            reasoning = source.get("content") if source["type"] == "thought" else None
+        if isinstance(reasoning, str) and reasoning.strip():
+            target["reasoning_original"] = reasoning
         target.update(event_type=source["type"], label=labels[source["type"]],
             relative_time_ms=number(source.get("ts_ms")), source_step_id=source.get("step_id"),
             reasoning_summary=source.get("reasoning") or "源日志未记录推理摘要",

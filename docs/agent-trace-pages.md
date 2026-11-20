@@ -78,18 +78,17 @@ workspace 使用 `view=execution&include=options` 或 include=dashboard；列表
 
 沿用 agent_trace_export 任务、任务查询、下载票据及同源二进制下载。
 现在除 tools 外支持 ingest/statistics/execution，按页面协议验证 batch/filtered/sample 范围与内容。
-可生成 PNG、ZIP，统计样本支持完整 JSON。ZIP 按请求包含标准化 JSON、离线HTML、证据索引、
-错误报告、统计摘要、CSV 和 manifest。执行页 PNG 聚焦选中样本，清单保存批次上下文与请求内容范围。
+当前视图生成 JSON，结果包生成 ZIP，统计样本支持完整 JSON。ZIP 按请求包含标准化 JSON、离线HTML、证据索引、
+错误报告、统计摘要、CSV 和 manifest。执行页 JSON 聚焦选中样本，清单保存批次上下文与请求内容范围。
 产物冻结快照和选择，执行统一脱敏及包内一致匿名化；manifest 保存来源说明、范围及文件哈希。
-票据5分钟有效、产物24小时保留。PNG 需要中文字体，可配置 AGENT_TRACE_FONT。
+票据5分钟有效、产物24小时保留。轨迹审计不提供 PNG 导出，无需配置中文字体。
 
 ## 使用与验证
 
 1. 重启后端并刷新前端，关闭“示例演示”。
 2. 接入页点击“新建批次”，上传文件，再点击“开始解析”。
 3. 其他三页沿用同一批次、快照和样本；无记录的字段显示未提供，未审计不等于无风险。
-4. PNG/ZIP/JSON 使用服务端冻结的快照和脱敏产物，PNG 不再截取下载时的实时 DOM。
-5. 如本机没有中文字体，为 PNG 配置 AGENT_TRACE_FONT。
+4. JSON/ZIP 使用服务端冻结的快照和脱敏产物。
 
 新增隔离数据库流程测试：tests/test_agent_trace_workflow.py、tests/test_agent_trace_trajectory.py。
 涵盖默认隐藏旧模拟来源、实际文件导入、字段保留、非首屏定位、重解析、审计证据和导出。

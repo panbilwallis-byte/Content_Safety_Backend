@@ -192,8 +192,8 @@ def test_long_json_chunks_utf8_version_and_scope(pages):
 @pytest.mark.parametrize("kind",["view","package"])
 def test_three_page_exports(pages,view,kind):
     scope={**pages["scope"],"projection_version":stats.VERSION if view=="statistics" else pages["scope"]["projection_version"]}
-    contents=[view+"_png"] if kind=="view" else ["normalized_json","offline_html","evidence_index","manifest"]
-    command={"capability_code":"agent_trace_export","input":{**scope,"view":view,"export_kind":kind,"format":"png" if kind=="view" else "zip",
+    contents=["normalized_json"] if kind=="view" else ["normalized_json","offline_html","evidence_index","manifest"]
+    command={"capability_code":"agent_trace_export","input":{**scope,"view":view,"export_kind":kind,"format":"json" if kind=="view" else "zip",
         "selected_trace_id":pages["trace"],"scope":{"type":"sample","trace_ids":[pages["trace"]]},"contents":contents}}
     r=post(pages,"/api/v1/tasks/execute",command)
     assert r.status_code==200,r.text
@@ -203,7 +203,7 @@ def test_three_page_exports(pages,view,kind):
     ticket=post(pages,ROOT+f"/artifacts/{aid}/download-tickets",{}).json()["data"]
     file=pages["client"].get(ticket["download_url"],headers={"Authorization":""})
     assert file.status_code==200
-    if kind=="view":assert file.content.startswith(b'\x89PNG')
+    if kind=="view":assert file.json()["view"] == view
     else:
         with zipfile.ZipFile(io.BytesIO(file.content)) as z:
             assert "report.html" in z.namelist()

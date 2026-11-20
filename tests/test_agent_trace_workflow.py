@@ -158,7 +158,7 @@ def test_export_uses_frozen_snapshot_and_all_pages(env, monkeypatch, tmp_path):
         _, scope = q.resolve(db, bid, {})
         tasks = []
         for kind, fmt, contents in [("package", "zip", ["normalized_json", "evidence_index", "manifest"]),
-                                     ("view", "png", ["ingest_png"])]:
+                                     ("view", "json", ["normalized_json"])]:
             t, _ = exports.create_task(db, {**scope, "view": "ingest", "export_kind": kind, "format": fmt,
                 "scope": {"type": "batch", "trace_ids": []}, "contents": contents,
                 "redaction_profile": "standard", "anonymize_ids": True}, USER, uuid4().hex)
@@ -174,8 +174,11 @@ def test_export_uses_frozen_snapshot_and_all_pages(env, monkeypatch, tmp_path):
             assert t.input_data["snapshot_id"] == scope["snapshot_id"]
             artifact = db.get(TraceArtifact, t.result["artifacts"][0]["artifact_id"])
             data = (exports.directory() / artifact.storage_name).read_bytes()
-            if artifact.mime_type == "image/png":
-                assert data.startswith(b"\x89PNG")
+            if artifact.mime_type == "application/json":
+                normalized = json.loads(data)
+                assert len(normalized["samples"]) == 9
+                assert sum(len(s["calls"]) for s in normalized["samples"]) == 9
+                assert b"EXPORT-0" not in data
             else:
                 archive = zipfile.ZipFile(io.BytesIO(data))
                 normalized = json.loads(archive.read("normalized.json"))

@@ -20,7 +20,16 @@ def recorded_audit(record, payload, events, calls):
     if not isinstance(evidence, list):
         raise ValueError("audit.evidence 必须为列表")
     raw_events = record.get("events", record.get("messages", []))
-    by_idx = {e.get("idx", i): target for i, (e, target) in enumerate(zip(raw_events, events)) if isinstance(e, dict)}
+    # A message can emit content and several tool-call events. Zip would shift
+    # every subsequent source coordinate; use recorded source paths instead.
+    by_idx = {}
+    for i, source in enumerate(raw_events):
+        if not isinstance(source, dict):
+            continue
+        prefix = f"events[{i}]" if "events" in record else f"messages[{i}]"
+        targets = [e for e in events if (e.get("source_ref") or {}).get("source_path", "").split(".")[0] == prefix]
+        if len(targets) == 1:
+            by_idx[source.get("idx", i)] = targets[0]
     rows = []
     for i, item in enumerate(evidence):
         if not isinstance(item, dict) or item.get("event_idx") not in by_idx:
@@ -40,7 +49,7 @@ def recorded_audit(record, payload, events, calls):
             "match_pattern": item.get("matched_text") or "源日志未提供匹配片段", "severity": severity,
             "rule_id": item.get("rule_id"), "rule_version": audit.get("version"), "review_status": "pending",
             "confidence": confidence, "confidence_kind": "source_log" if confidence is not None else "unknown",
-            "related_call_ids": [c["call_id"] for c in calls if c["event_id"] == target["event_id"]],
+            "related_call_ids": [c["call_id"] for c in calls if target["event_id"] in {c["event_id"], c.get("return_event_id")}],
             "data_origin": "actual", "detection_source": "external_record"})
         target["risk_level"] = severity
     payload["risk_types"] = list({r["risk_type"]["code"]: r["risk_type"] for r in rows}.values())
