@@ -172,19 +172,17 @@ def audit_process(payload, events, calls, source_evidence=(), record=None):
         add("incomplete_execution", "operation", "流程未完成", events[-1]["event_id"],
             payload.get("error") or f"流程状态={payload['task_status']}")
 
-    # Identical requests are clues, not a verdict that the tool use was inefficient.
-    previous = {}
-    for call in calls:
-        try:
-            args = json.loads(call.get("input_json", "null"))
-            canonical = json.dumps(args, sort_keys=True, ensure_ascii=False)
-        except (ValueError, TypeError):
-            canonical = str(call.get("input_json", ""))
-        key = (call.get("tool_name"), canonical)
-        if key in previous:
-            add("repeated_request", "efficiency", "相同工具参数再次请求（待核查）", call["event_id"],
-                f"前次调用={previous[key]}；参数={canonical}", call)
-        previous[key] = call["call_id"]
+    from app.services.agent_trace_duplicates import project_calls
+    projected, groups = project_calls(calls)
+    payload["inefficiency_groups"] = groups
+    call_by_id = {c["call_id"]: c for c in calls}
+    for call, value in zip(calls, projected):
+        call["behavior_tags"] = value["behavior_tags"]
+    for group in groups:
+        for cid in group["duplicate_call_ids"]:
+            call = call_by_id[cid]
+            add("repeated_request", "efficiency", "已核验重复调用", call["event_id"],
+                f"首次调用={group['canonical_call_id']}；参数={call.get('input_json', '')}", call)
 
     # Producer evidence remains separate from generated rules, with its original IDs.
     for item in evidence[:len(source_evidence)]:

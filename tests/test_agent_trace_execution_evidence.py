@@ -86,7 +86,7 @@ def test_full_description_and_evidence_summary_for_hover(actual, mode):
     response = fetch(actual, section="overview", redaction_mode=mode)
     assert response.status_code == 200, response.text
     data = response.json()["data"]
-    event = data["events"]["items"][2]
+    event = data["events"]["items"][0]
     expected = actual["original"] if mode == "raw" else q.redact(actual["original"])
     assert event["description"] == expected
     assert event["original_text"] == expected
@@ -110,8 +110,8 @@ def test_historical_description_recovery_preserves_independent_description(actua
         saved = deepcopy(event.payload)
         db.commit()
     data = fetch(actual, section="overview", redaction_mode="raw").json()["data"]
-    assert data["events"]["items"][2]["description"] == (description if independent else actual["original"])
-    assert data["events"]["items"][2]["original_text"] == actual["original"]
+    assert data["events"]["items"][0]["description"] == (description if independent else actual["original"])
+    assert data["events"]["items"][0]["original_text"] == actual["original"]
     with actual["sessions"]() as db:
         assert db.scalar(select(TraceEvent).where(TraceEvent.snapshot_id == actual["scope"]["snapshot_id"],
                                                  TraceEvent.event_id == actual["events"][2]["event_id"])).payload == saved
@@ -220,7 +220,7 @@ def test_missing_original_never_falls_back_to_display_summary(actual, change):
     assert response.status_code == 404
     assert "完整原文" in response.json()["message"]
     overview = fetch(actual, section="overview").json()["data"]
-    assert overview["events"]["items"][2]["original_text"] is None
+    assert overview["events"]["items"][0]["original_text"] is None
 
 
 def test_empty_original_is_valid_complete_source(actual):
@@ -232,7 +232,7 @@ def test_empty_original_is_valid_complete_source(actual):
     document = fetch(actual).json()["data"]
     assert document["original_text"] == "" and document["complete"] is True
     overview = fetch(actual, section="overview").json()["data"]
-    assert overview["events"]["items"][2]["original_text"] == ""
+    assert overview["events"]["items"][0]["original_text"] == ""
 
 
 @pytest.mark.parametrize("section", ["overview", "events", "selection"])
@@ -266,9 +266,9 @@ def test_dismissed_evidence_overrides_stale_event_risk_level(actual):
             item.payload = {**item.payload, "review_status": "dismissed"}
         db.commit()
     document = fetch(actual, section="overview").json()["data"]
-    assert document["events"]["items"][2]["risk_level"] == "none"
-    assert document["events"]["items"][2]["evidence_summary"] == ""
-    assert document["graph"]["nodes"][2]["risk_level"] == "none"
+    assert document["events"]["items"][0]["risk_level"] == "none"
+    assert document["events"]["items"][0]["evidence_summary"] == ""
+    assert document["graph"]["nodes"][0]["risk_level"] == "none"
     assert all(e["has_risk"] is False for e in document["events"]["items"])
     assert document["first_risk_event_id"] is None
     with actual["sessions"]() as db:
@@ -277,7 +277,7 @@ def test_dismissed_evidence_overrides_stale_event_risk_level(actual):
 
 def test_evidence_and_event_flags_work_beyond_first_event_page(actual):
     document = fetch(actual, section="selection", event_page_size=1).json()["data"]
-    assert document["events"]["page"] == 3
+    assert document["events"]["page"] == 1  # first action, not third raw event
     assert document["events"]["items"][0]["has_risk"] is True
     evidence = fetch(actual, redaction_mode="raw").json()["data"]
     assert evidence["original_text"] == actual["original"]

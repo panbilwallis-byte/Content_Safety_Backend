@@ -129,7 +129,7 @@ def test_statistics_full_contract_filters_and_navigation(pages):
 
 
 def test_source_filter_does_not_change_ingest_batch_summary(pages):
-    batch=create(pages);one=upload(pages,dumps(OPENAI),"one.json");two=upload(pages,dumps(ANTHROPIC),"two.json")
+    batch=create(pages);one=upload(pages,dumps(OPENAI),"one.json");two=upload(pages,dumps({**OPENAI,"language":"en"}),"two.json")
     task=parse(pages,batch,[one,two]);scope={"batch_id":batch["batch_id"],"snapshot_id":task["result"]["snapshot_id"]}
     w=pages["client"].get(ROOT+"/workspace",params={**scope,"source_id":one}).json()["data"]
     assert w["summary"]["parsed_trace_count"]==2 and w["sample_page"]["total"]==1
@@ -258,7 +258,7 @@ def test_incremental_publish_keeps_old_snapshot(pages):
     batch=create(pages);one=upload(pages,dumps(OPENAI),"first.json")
     first=parse(pages,batch,[one]);old=first["result"]["snapshot_id"]
     before=pages["client"].get(ROOT+"/workspace",params={"batch_id":batch["batch_id"]}).json()["data"]
-    two=upload(pages,dumps(ANTHROPIC),"second.json")
+    two=upload(pages,dumps(TRAJECTORY),"second.json")
     second=parse(pages,before["batch"],[two]);assert second["status"]=="succeeded"
     after=pages["client"].get(ROOT+"/workspace",params={"batch_id":batch["batch_id"]}).json()["data"]
     assert after["summary"]["parsed_trace_count"]==2

@@ -129,7 +129,8 @@ def test_tool_failures_retries_unmatched_and_unknown_names_are_not_security(env,
     first, second, aggregate = rows(fetch(env, bid))
     r = first["results"]
     assert r["B2"]["judgment"] == "无风险" and not r["B3"]["risks"]
-    assert r["C2"]["markers"] and r["C3"]["failures"]
+    assert r["C2"]["markers"] == []
+    assert r["C3"]["failures"]
     assert "超时" in r["C3"]["failures"][0]["error_type"]
     assert r["C5"]["issues"][0]["evidence"]
     assert second["results"]["A3"]["tool_counts"] == {"unknown": 1}

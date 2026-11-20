@@ -9,6 +9,7 @@ from sqlalchemy import select, func
 from app.models.agent_traces import TraceBatch, TraceSample, TraceProjection, TraceStatisticsSample, TraceCall, TraceEvent
 from app.services.agent_trace_generation import stable_id, dumps
 from app.services import agent_trace_query as q
+from app.services import agent_trace_steps
 
 VERSION = "statistics_v1"
 CATEGORIES = [("prompt_injection", "提示注入"), ("unauthorized_access", "越权访问"),
@@ -119,7 +120,7 @@ def summary(s, st, scope, user):
         "source_format": p["source"].get("format_code", "value_analysis"), "test_category": v["test_category"],
         "test_category_label": dict(CATEGORIES).get(v["test_category"], "未知"), "token_usage": v["token_usage"],
         "reasoning_char_count": reasoning_char_count(s),
-        "event_count": p["event_count"], "call_count": p["call_count"], "retry_count": p.get("retry_count", 0),
+        **agent_trace_steps.counts(s), "call_count": p["call_count"], "retry_count": p.get("retry_count", 0),
         "duration_ms": p.get("duration_ms"), "task_status": v["task_status"], "audit_decision": v["audit_decision"],
         "risk_level": p.get("risk_level", "unknown"), "risk_types": p.get("risk_types", []),
         "risk_steps": p.get("risk_steps", []), "first_risk_step": p.get("first_risk_step"),
@@ -147,7 +148,13 @@ def aggregate(db, scope, params, user):
     data = rows(db, scope, params)
     n = len(data)
     calls = [{**r.payload,"_trace_id":r.trace_id} for r in db.scalars(select(TraceCall).where(TraceCall.snapshot_id == scope["snapshot_id"],
-        TraceCall.trace_id.in_([s.trace_id for s, _ in data])))] if data else []
+        TraceCall.trace_id.in_([s.trace_id for s, _ in data])).order_by(TraceCall.trace_id, TraceCall.ordinal))] if data else []
+    from app.services.agent_trace_duplicates import project_calls
+    from app.services.agent_trace_call_status import project_calls as project_statuses
+    calls_by_trace = {}
+    for call in calls:
+        calls_by_trace.setdefault(call["_trace_id"], []).append(call)
+    calls = [call for sample, _ in data for call in project_calls(project_statuses(calls_by_trace.get(sample.trace_id, [])))[0]]
     risk = len(filtered(data, "risk"))
     missing = len(filtered(data, "missing_fields"))
     def metric(value, unit="count", valid=None):
@@ -158,7 +165,7 @@ def aggregate(db, scope, params, user):
                   and st.payload["token_usage"]["final_output"] is not None]
     denom = sum(v["final_output"] for v in compatible)
     totals = {k: sum(st.payload["token_usage"][k] or 0 for _, st in data) for k in ("input", "reasoning_recorded", "final_output")}
-    steps = [s.payload["event_count"] for s, _ in data if s.payload.get("event_count") is not None]
+    steps = [value for s, _ in data for value in [agent_trace_steps.counts(s)["step_count"]] if value is not None]
     audit_valid=sum(st.payload["audit_decision"] in {"risk_found","no_risk_found"} for _,st in data)
     token_valid=sum(any(st.payload["token_usage"][key] is not None for key in ("input","reasoning_recorded","final_output")) for _,st in data)
     task_valid = sum(st.payload["task_status"] in {"completed", "failed", "terminated", "cancelled", "blocked"} for _, st in data)
@@ -202,7 +209,6 @@ def aggregate(db, scope, params, user):
             codes.add("argument_error")
         for finding in c.get("rule_findings", []):
             rule = finding.get("rule_id")
-            if rule in {"recorded_duplicate", "repeated_request"}:codes.add("duplicate")
             if rule == "recorded_retry":codes.add("retry")
         for code in codes:
             matrix[(category_for[c["_trace_id"]], code, c["_trace_id"], c["call_id"])] = 1
@@ -271,9 +277,14 @@ def workspace(db, params, user):
 
 
 def normalized(db,scope,sample):
+    raw_events = q.process_records(db,scope,sample.trace_id,TraceEvent)
+    events, mapping, uncounted, counts = agent_trace_steps.project(sample, raw_events, sanitize=q.redact,
+        reasoning_getter=q.original_reasoning, source_text_getter=q.recorded_event_text)
     return {"trace_id":sample.trace_id,"display_id":sample.display_id,"sample_id":sample.sample_id,
             "value_result":sample.result,"data_origin":sample.payload.get("data_origin"),
-            "events":q.process_records(db,scope,sample.trace_id,TraceEvent),"calls":q.process_records(db,scope,sample.trace_id,TraceCall)}
+            "events":raw_events,"steps":events, **counts,
+            "event_step_mapping":[{"source_event_id":source,"event_id":target} for source,target in mapping.items()],
+            "uncounted_source_events":uncounted,"calls":q.process_records(db,scope,sample.trace_id,TraceCall)}
 
 
 def detail(db,scope,trace,params,user):

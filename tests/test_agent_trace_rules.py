@@ -118,7 +118,7 @@ def test_behavior_matrix_excludes_normal_and_counts_recorded_block_once(env, mon
         assert matrix["rows"][0]["label"] == "越权访问"
         counts = {c["behavior_code"]: c["count"] for c in matrix["rows"][0]["cells"]}
         assert counts["policy_denied"] == 1
-        assert counts["duplicate"] == 1
+        assert counts["duplicate"] == 0
         assert counts["retry"] == 1
         assert "unauthorized" not in {c["code"] for c in matrix["columns"]}
         assert workspace["list_counts"]["all"] == 2

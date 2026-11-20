@@ -32,7 +32,7 @@ def test_trajectory_keeps_event_identity_and_recorded_fields():
     validate_process(payload, events, calls)
 
 
-@pytest.mark.parametrize("status,expected", [("blocked", "not_executed"), ("error", "failed"), ("unknown", "unknown")])
+@pytest.mark.parametrize("status,expected", [("blocked", "not_executed"), ("error", "failed"), ("unknown", "failed")])
 def test_trajectory_call_status_and_policy_duration(status, expected):
     r = deepcopy(EXAMPLE)
     r["events"][3]["tool_status"] = status
@@ -95,5 +95,6 @@ def test_upload_publish_and_four_projections_without_http(env, tmp_path):
         assert tools["calls"]["total"] == 1
         assert tools["calls"]["items"][0]["execution_status"] == "succeeded"
         execution = q.execution_detail(db, scope, trace, {}, user)
-        assert execution["events"]["total"] == 5
+        assert execution["events"]["total"] == 2
+        assert execution["summary"]["raw_event_count"] == 5
         assert stats.workspace(db, {"batch_id": b["batch_id"]}, user)["kpis"]["recorded_tokens"]["value"] == 150

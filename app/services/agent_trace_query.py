@@ -20,6 +20,7 @@ from app.models.agent_traces import (
 )
 from app.services.agent_trace_generation import VERSION, dumps
 from app.services import agent_trace_sync as sync
+from app.services import agent_trace_steps as steps
 
 ROOT = "/compliance/agent-traces"
 
@@ -228,6 +229,10 @@ def sample_summary(row):
             "source_id": p["source"]["source_id"], "test_category": p.get("test_category"), **rule_audit_projection(p)}
 
 
+def execution_summary(row):
+    return {**sample_summary(row), **steps.counts(row)}
+
+
 def sample_statement(scope, params):
     query = select(TraceSample).where(TraceSample.snapshot_id == scope["snapshot_id"])
     q = str(params.get("q", "")).strip()
@@ -258,7 +263,7 @@ def samples(db, scope, params, view):
     query = sample_statement(scope, params)
     total = db.scalar(select(func.count()).select_from(query.order_by(None).subquery()))
     rows = list(db.scalars(query.offset((num - 1) * size).limit(size)))
-    result = {"items": [sample_summary(r) for r in rows], "total": total, "page": num,
+    result = {"items": [(execution_summary(r) if view == "execution" else sample_summary(r)) for r in rows], "total": total, "page": num,
               "page_size": size, "total_pages": (total + size - 1) // size}
     result["context"] = {**scope, "q": params.get("q", ""), "language": params.get("language", "all"),
         "risk_level": params.get("risk_level", "all"), "audit_decision": params.get("audit_decision", "all"),
@@ -374,6 +379,10 @@ def tool_detail(db, batch, scope, trace, params, user):
     if section not in {"overview", "calls", "sequence", "selection"}:
         fail(422, "工具交互 section 无效")
     calls = process_records(db, scope, trace, TraceCall)
+    from app.services.agent_trace_call_status import project_calls as project_statuses
+    calls = project_statuses(calls)
+    from app.services.agent_trace_duplicates import project_calls
+    calls, duplicate_groups = project_calls(calls)
     calls = redact(calls, preserve_ids=True)
     lookup = {c["call_id"]: c for c in calls}
     cid = params.get("call_id")
@@ -418,6 +427,10 @@ def tool_detail(db, batch, scope, trace, params, user):
     if section == "sequence":
         return {**common, "sequence": sequence}
     counts = {s: sum(c["execution_status"] == s for c in calls) for s in ("succeeded", "failed", "not_executed", "unknown")}
+    findings = rule_audit_projection(sample.payload)
+    if steps.plan(sample) is not None:
+        display_events, event_mapping, _, _ = steps.project(sample, process_records(db, scope, trace, TraceEvent))
+        findings = steps.remap_findings(findings, event_mapping, display_events)
     return {**common, "summary": {"batch_display_id": batch.display_id, "batch_name": batch.payload.get("name"), "trace_display_id": sample.display_id,
             "language": sample.language, "test_category": sample.payload.get("test_category"),
             "risk_level": sample.payload.get("risk_level", "unknown"), "event_count": sample.payload["event_count"],
@@ -429,9 +442,9 @@ def tool_detail(db, batch, scope, trace, params, user):
             "not_executed_count": counts["not_executed"], "unknown_status_count": counts["unknown"],
             "overreach_count": sum(any(t["code"] == "overreach" for t in c["behavior_tags"]) for c in calls),
             "inefficient_count": sum(any(t["code"] == "inefficient" for t in c["behavior_tags"]) for c in calls)},
-        **rule_audit_projection(sample.payload),
+        **findings,
         "timing": timing(sample.payload, calls), "sequence": sequence, "calls": calls_page, "selection": selected,
-        "sample_analysis": {"inefficiency_groups": sample.payload.get("inefficiency_groups", [])},
+        "sample_analysis": {"inefficiency_groups": duplicate_groups},
         "permissions": permissions(user), "data_origin": sample.payload["data_origin"],
         "warnings": [{"code": "generated_process", "message": "含模拟过程，不是实际风险审计证据"}] if sample.payload["data_origin"] != "actual" else []}
 
@@ -440,6 +453,8 @@ def recorded_event_text(event):
     """Full recorded content only; display descriptions are never source text."""
     if event.get("data_origin") == "generated":
         return None
+    if "recorded_original_text" in event:
+        return event["recorded_original_text"]
     path = (event.get("source_ref") or {}).get("source_path", "")
     if path.endswith((".reasoning_content", ".reasoning")):
         reasoning = event.get("reasoning_summary")
@@ -517,19 +532,38 @@ def execution_detail(db, scope, trace, params, user):
             event["relative_time_ms"] = None
     has_event_time = any(e.get("relative_time_ms") is not None for e in events)
     eid = params.get("event_id")
-    if eid and not any(e["event_id"] == eid for e in events):
-        fail(404, "事件不属于当前样本")
     if section in {"selection", "evidence"} and not eid:
         fail(422, "事件详情必须提供 event_id")
     if section == "evidence":
+        if not any(e["event_id"] == eid for e in events):
+            display_events, _, _, _ = steps.project(sample, events,
+                sanitize=redact if mode != "raw" else lambda value: value)
+            if not any(e["event_id"] == eid for e in display_events):
+                fail(404, "事件不属于当前样本")
+            return execution_evidence(scope, trace, display_events, eid, mode)
         return execution_evidence(scope, trace, events, eid, mode)
+    raw_events = events
+    events, event_mapping, uncounted, step_counts = steps.project(
+        sample, raw_events, sanitize=redact if mode != "raw" else lambda value: value,
+        reasoning_getter=original_reasoning, source_text_getter=recorded_event_text)
+    # Old deep links (including tool-return events) select the owning step.
+    # Uncounted source records remain available through section=evidence.
+    if eid:
+        if eid not in event_mapping and not any(e["event_id"] == eid for e in events + uncounted):
+            fail(404, "事件不属于当前样本")
+        eid = event_mapping.get(eid, eid if any(e["event_id"] == eid for e in events) else None)
+    graph_kind = "graph:" + steps.VERSION if step_counts["step_count"] is not None else "graph:raw:" + steps.VERSION
     if mode != "raw":
         events = redact(events, preserve_ids=True)
+        uncounted = redact(uncounted, preserve_ids=True)
     evidence = [deepcopy(e.payload) for e in db.scalars(select(TraceEvidence).where(
         TraceEvidence.snapshot_id == scope["snapshot_id"], TraceEvidence.trace_id == trace,
         TraceEvidence.projection_version == scope["projection_version"]).order_by(TraceEvidence.id)) if e.payload.get("review_status") != "dismissed"]
     if mode != "raw":
         evidence = redact(evidence,preserve_ids=True)
+    source_only_evidence = [e for e in evidence if e["event_id"] not in event_mapping]
+    evidence = [{**e, "source_event_id": e["event_id"], "event_id": event_mapping[e["event_id"]]}
+                for e in evidence if e["event_id"] in event_mapping]
     evidence_by_event = {}
     for item in evidence:
         evidence_by_event.setdefault(item["event_id"], []).append(item)
@@ -559,7 +593,7 @@ def execution_detail(db, scope, trace, params, user):
     def selection(event, units=16384):
         idx = event_positions[event["event_id"]]
         items = evidence_by_event.get(event["event_id"], [])
-        content_version=hashlib.sha256(dumps([scope,trace,event["event_id"],mode,str(user["uid"]),event.get("source_excerpt"),event.get("reasoning_summary"),event.get("reasoning_original")]).encode()).hexdigest()
+        content_version=hashlib.sha256(dumps([steps.VERSION,scope,trace,event["event_id"],mode,str(user["uid"]),event.get("source_excerpt"),event.get("reasoning_summary"),event.get("reasoning_original")]).encode()).hexdigest()
         texts={}
         for field in ("source_excerpt","reasoning_summary"):
             text=text_preview(event.get(field,""),units)
@@ -575,22 +609,23 @@ def execution_detail(db, scope, trace, params, user):
         lineage_nodes.append({"id":event["event_id"],"kind":"event","event_id":event["event_id"],"label":event["label"]})
         return {"event_id": event["event_id"], "display_id": event["display_id"], "ordinal": event["ordinal"],
             **risk_fields(event),
-            "graph_locator":{"cursor":cursor(scope,trace,"graph",idx//500*500,user) if idx>=500 else None},
+            "graph_locator":{"cursor":cursor(scope,trace,graph_kind,idx//500*500,user) if idx>=500 else None},
             "previous_event_id": events[idx - 1]["event_id"] if idx else None,
             "next_event_id": events[idx + 1]["event_id"] if idx + 1 < len(events) else None,
-            "content": {**texts,"source_ref":references,"content_version":content_version,
+            "content": {**texts,"source_ref":references,"source_event_ids":event.get("source_event_ids", []),
+                        "shared_reasoning_step":event.get("shared_reasoning_step"),"content_version":content_version,
                         "redaction_mode": mode, "permissions_version": "platform-v1","availability":"available"},
             "risk_evidence": {"items": items, "total": len(items)},
             "lineage": {"nodes":lineage_nodes,"total_nodes":len(lineage_nodes),"complete":True,"unresolved_refs":[],"next_cursor":None,
                         "edges": [{"from_id":references["source_id"],"to_id":event["event_id"],"relation":"source_reference"}] if references.get("source_id") else [], "availability": "available"}}
-    rendered = [{**{k: v for k, v in e.items() if k not in {"source_excerpt", "reasoning_summary", "reasoning_original"}},
+    rendered = [{**{k: v for k, v in e.items() if k not in {"source_excerpt", "reasoning_summary", "reasoning_original", "recorded_original_text"}},
                  "original_text": recorded_event_text(e),
                  **risk_fields(e),
                  "selection_preview": selection(e, 4096)} for e in events]
     sp = page(rendered, num, size)
     selected = next((selection(e) for e in events if e["event_id"] == eid), None)
     common = {"view": "execution", "section": section, "scope": {**scope, "permissions_version": "platform-v1"},
-              "trace_id": trace, "first_risk_event_id": first_risk, "has_event_time": has_event_time}
+              "trace_id": trace, "first_risk_event_id": first_risk, "has_event_time": has_event_time, **step_counts}
     if params.get("selection_cursor"):
         if section!="selection" or not selected:fail(422,"长内容游标要求selection和event_id")
         token=unsign(params["selection_cursor"])
@@ -608,26 +643,35 @@ def execution_detail(db, scope, trace, params, user):
             "next_cursor":None if done else cursor(scope,trace,kind,end,user),"content_version":version}}
     if section in {"events", "selection"}:
         return {**common, "events": sp, "selection": selected}
-    start = offset(params.get("graph_cursor"), scope, trace, "graph", user)
+    start = offset(params.get("graph_cursor"), scope, trace, graph_kind, user)
     end = min(start + 500, len(events))
     ids = {e["event_id"] for e in events[:end]}
     previous = {e["event_id"] for e in events[:start]}
-    edges = [r.payload for r in db.scalars(select(TraceRelation).where(TraceRelation.snapshot_id == scope["snapshot_id"],
-        TraceRelation.trace_id == trace)) if {r.payload["from_event_id"], r.payload["to_event_id"]} <= ids
-        and not {r.payload["from_event_id"], r.payload["to_event_id"]} <= previous]
+    if step_counts["step_count"] is not None:
+        # Steps already have their source execution order; raw event sequences
+        # contain extra messages and may have return edges that run backwards.
+        edges = [{"edge_id": f"step-edge-{i}", "from_event_id": a["event_id"], "to_event_id": b["event_id"],
+                  "relation": "sequence"} for i, (a, b) in enumerate(zip(events, events[1:]), 1)
+                 if {a["event_id"], b["event_id"]} <= ids and not {a["event_id"], b["event_id"]} <= previous]
+    else:
+        edges = [r.payload for r in db.scalars(select(TraceRelation).where(TraceRelation.snapshot_id == scope["snapshot_id"],
+            TraceRelation.trace_id == trace)) if {r.payload["from_event_id"], r.payload["to_event_id"]} <= ids
+            and not {r.payload["from_event_id"], r.payload["to_event_id"]} <= previous]
     graph = {"nodes": [{**{k: e[k] for k in ("event_id", "display_id", "ordinal", "label")},
                         "risk_level": risk_fields(e)["risk_level"]} for e in events[start:end]],
              "edges": edges, "total_nodes": len(events), "loaded_nodes": end, "complete": end >= len(events),
-             "next_cursor": cursor(scope, trace, "graph", end, user) if end < len(events) else None}
+             "next_cursor": cursor(scope, trace, graph_kind, end, user) if end < len(events) else None}
     if section == "graph":
         return {**common, "graph": graph}
     patterns = [{"pattern_id": e["evidence_id"], "label": e["risk_type"]["label"], "event_id": e["event_id"],
         "event_display_id": next(x["display_id"] for x in events if x["event_id"] == e["event_id"]),
         "snippet": e["match_pattern"], "evidence_id": e["evidence_id"]} for e in evidence]
-    return {**common, "summary": sample_summary(sample), "graph": graph, "events": sp, "selection": selected,
+    return {**common, "summary": execution_summary(sample), "graph": graph, "events": sp, "selection": selected,
+        "uncounted_source_events": uncounted, "source_only_evidence": source_only_evidence,
         "risk_distribution": {"items": [{"code": code, "label": next(e["risk_type"]["label"] for e in evidence if e["risk_type"]["code"] == code),
             "event_count": len({e["event_id"] for e in evidence if e["risk_type"]["code"] == code})} for code in sorted({e["risk_type"]["code"] for e in evidence})],
                               "availability": "partial" if evidence else "unavailable"},
         "danger_patterns": page(patterns, number(params, "pattern_page", 1, 2_147_483_647), 20),
-        **rule_audit_projection(sample.payload),
+        **(steps.remap_findings(rule_audit_projection(sample.payload), event_mapping, events)
+           if step_counts["step_count"] is not None else rule_audit_projection(sample.payload)),
         "permissions": permissions(user), "data_origin": sample.payload["data_origin"]}

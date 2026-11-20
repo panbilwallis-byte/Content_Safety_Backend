@@ -104,7 +104,8 @@ def test_overview_is_coherent_and_not_mutating(env):
     assert response.status_code == 200
     d = response.json()["data"]
     assert d["metrics"] == {"call_count": 7, "tool_kind_count": 4, "success_count": 5,
-        "error_count": 1, "not_executed_count": 1, "unknown_status_count": 0, "overreach_count": 1, "inefficient_count": 2}
+        "error_count": 1, "not_executed_count": 1, "unknown_status_count": 0, "overreach_count": 1, "inefficient_count": 3}
+    assert sum(len(g["duplicate_call_ids"]) for g in d["sample_analysis"]["inefficiency_groups"]) == 3
     assert d["timing"]["tool_duration_sum_ms"] == 5000
     assert d["timing"]["tool_wall_time_ms"] == 5000
     assert d["timing"]["other_duration_ms"] == 3600

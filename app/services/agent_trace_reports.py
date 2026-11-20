@@ -66,7 +66,10 @@ def validate(db,data,user):
         if spec["type"]=="sample" and row.trace_id!=ids[0]:q.fail(409,"选中样本与范围不匹配")
         if data.get("selected_event_id"):
             from app.models.agent_traces import TraceEvent
-            if not any(e["event_id"]==data["selected_event_id"] for e in q.process_records(db,scope,row.trace_id,TraceEvent)):q.fail(404,"选中事件不存在")
+            raw_events = q.process_records(db,scope,row.trace_id,TraceEvent)
+            from app.services.agent_trace_steps import project
+            display_events, _, _, _ = project(row, raw_events)
+            if not any(e["event_id"]==data["selected_event_id"] for e in raw_events + display_events):q.fail(404,"选中事件不存在")
     state=data.get("ui_state",{})
     if not isinstance(state,dict) or len(dumps(state))>20000:q.fail(422,"ui_state无效或过大")
     return frozen
@@ -84,7 +87,8 @@ def build(db,task):
               "requested_scope":data["scope"],"notice":"含模拟过程或默认展示数据时，不作为真实审计结论"}
     for row in rows:
         value=stats.normalized(db,scope,row)
-        document["samples"].append({**value,"summary":q.sample_summary(row),"data_origin":row.payload.get("data_origin","actual"), **q.rule_audit_projection(row.payload)})
+        summary = q.execution_summary(row) if data["view"] in {"execution", "statistics"} else q.sample_summary(row)
+        document["samples"].append({**value,"summary":summary,"data_origin":row.payload.get("data_origin","actual"), **q.rule_audit_projection(row.payload)})
     if data["view"]=="statistics":document["statistics"]=stats.aggregate(db,scope,{"language":data["scope"].get("language",data.get("language","all"))},{"uid":task.config["owner_id"]})
     document["errors"]=[b.payload.get("error_examples",[]) for b in db.scalars(select(TraceBinding).where(TraceBinding.batch_id==scope["batch_id"]))]
     document=anonymize(document,task.task_id,rows[0] if rows else None)
@@ -95,9 +99,9 @@ def build(db,task):
     if "normalized_json" in contents:files["normalized.json"]=dumps(document).encode()
     if "stats_summary" in contents:files["stats-summary.json"]=dumps(document.get("statistics",{})).encode()
     if "sample_table" in contents:
-        output=io.StringIO(newline="");writer=csv.writer(output);writer.writerow(["trace_id","language","event_count","call_count","duration_ms","data_origin"])
+        output=io.StringIO(newline="");writer=csv.writer(output);writer.writerow(["trace_id","language","event_count","step_count","raw_event_count","call_count","duration_ms","data_origin"])
         for sample in document["samples"]:
-            row=[sample["summary"].get(k,"") for k in ("trace_id","language","event_count","call_count","duration_ms","data_origin")]
+            row=[sample["summary"].get(k,"") for k in ("trace_id","language","event_count","step_count","raw_event_count","call_count","duration_ms","data_origin")]
             writer.writerow(["'"+v if isinstance(v,str) and v[:1] in {'=','+','-','@'} else v for v in row])
         files["samples.csv"]=output.getvalue().encode("utf-8-sig")
     if "evidence_index" in contents:

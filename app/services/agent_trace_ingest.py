@@ -355,19 +355,14 @@ def normalize(record,file_id,index,raw,line,override):
            "input_json":args if isinstance(args,str) else dumps(args),"output_json":"null","input_summary":str(args)[:512],"output_summary":"尚无关联返回","behavior_tags":[],
            "evidence_chain":[{"event_id":e["event_id"],"display_id":e["display_id"]}],"analysis":{"permission_comparison":{"rows":[],"actual_decision":{"message":"源日志没有记录权限判定"}},"error_attribution":None},"data_origin":"actual"}
         calls.append(c);pending[source_id]=c
-    def result(source_id,output,path,error=False):
+    def result(source_id,output,path,error=False,metadata=None):
         e=event("tool_result","tool",output,path)
         c=pending.pop(source_id,None)
         if not c:issues.append("call_unlinked");return
-        try:
-            body = json.loads(output) if isinstance(output, str) else output
-        except (ValueError, TypeError):
-            body = {}
-        body = body if isinstance(body, dict) else {}
-        status = "failed" if error else {"success":"succeeded", "succeeded":"succeeded", "blocked":"not_executed", "error":"failed", "failed":"failed"}.get(body.get("status"), "unknown")
+        from app.services.agent_trace_call_status import outcome
+        parsed_status = outcome(output, metadata=metadata, error=error)
         c.update(return_event_id=e["event_id"],output_json=output if isinstance(output,str) else dumps(output),output_summary=str(output)[:512],
-            execution_status=status,result_code=body.get("error_code") or ("ERROR" if error else "OK" if status=="succeeded" else "NOT_RECORDED"),
-            permission_decision="denied" if status=="not_executed" else "unknown")
+            **parsed_status)
         e["call_id"]=c["call_id"];c["evidence_chain"].append({"event_id":e["event_id"],"display_id":e["display_id"]})
     if fmt=="langchain_trace":
         runs=record["runs"]
@@ -382,7 +377,9 @@ def normalize(record,file_id,index,raw,line,override):
             if not isinstance(m,dict) or not isinstance(m.get("role"),str):raise ValueError("消息角色缺失")
             content=m.get("content")
             before = len(events)
-            if m["role"]=="tool":result(m.get("tool_call_id"),content if isinstance(content,str) else dumps(content),f"messages[{j}]")
+            if m["role"]=="tool":result(m.get("tool_call_id"),content if isinstance(content,str) else dumps(content),f"messages[{j}]",
+                metadata={k:m[k] for k in ("execution_status", "status", "is_error", "isError", "success", "error_code",
+                    "exit_code", "exitCode", "returncode", "return_code", "http_status", "status_code", "permission_decision") if k in m})
             else:
                 if m["role"] == "assistant":
                     if pending: issues.append("call_unlinked")

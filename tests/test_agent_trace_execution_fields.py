@@ -58,8 +58,9 @@ def test_reasoning_permissions_and_empty_original(recorded):
     assert fetch(recorded, redaction_mode="raw").status_code == 403
     data = fetch(recorded).json()["data"]
     assert "reasoning-secret" not in data["selection"]["content"]["reasoning_original"]["text"]
-    assert data["events"]["items"][0]["selection_preview"]["content"]["reasoning_original"] == {
-        "text": "", "highlights": [], "truncated": False, "provenance": "not_provided"}
+    assert data["events"]["total"] == 1  # user input is context, not a step
+    assert data["events"]["items"][0]["selection_preview"]["content"]["reasoning_original"]["provenance"] == "source_log"
+    assert q.original_reasoning({"event_type": "message", "data_origin": "actual"})["provenance"] == "not_provided"
 
 
 @pytest.mark.parametrize("patch,expected", [

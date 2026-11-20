@@ -8,6 +8,7 @@ from sqlalchemy import select
 from app.models.agent_traces import TraceEvent, TraceEvidence
 from app.services import agent_trace_query as q
 from app.services.agent_trace_competition import MISSING, NAMES, text
+from app.services.agent_trace_duplicates import duplicate_groups
 
 VERSION = "batch-report-v1"
 
@@ -106,17 +107,22 @@ def ordinary_report(db, scope, sample, calls):
 
     for finding in payload.get("rule_findings", []):
         category = finding.get("category")
-        if category not in {"operation", "efficiency"}:
+        if category != "operation":
             continue
         event = by_id.get(finding.get("event_id"))
         call = calls_by_id.get(finding.get("call_id"))
         item = {**location(event), "rule_id": finding.get("rule_id"), "issue": finding.get("label", MISSING),
                 "evidence": call_evidence(call) if call else evidence_for(event)}
-        if category == "operation":
-            item["error_type"] = finding.get("label", MISSING)
-            failures.append(item)
-        else:
-            repeats.append(item)
+        item["error_type"] = finding.get("label", MISSING)
+        failures.append(item)
+
+    for group in duplicate_groups(calls):
+        previous = calls_by_id[group["canonical_call_id"]]
+        for call_id in group["duplicate_call_ids"]:
+            call = calls_by_id[call_id]
+            repeats.append({**location(by_id[call["event_id"]]), "rule_id": "repeated_request",
+                            "issue": group["reason"], "previous_step_id": location(by_id[previous["event_id"]])["step_id"],
+                            "evidence": call_evidence(previous) + call_evidence(call)})
 
     issues = payload.get("issue_types", [])
     missing.extend({"field": code, "issue": label, "evidence": []} for code, label in (
