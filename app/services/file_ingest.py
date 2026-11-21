@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 UPLOAD_DIR = Path(__file__).resolve().parents[2] / "storage" / "uploads"
+POLLUTION_LABELS = {"污染": True, "未污染": False}
 
 
 def _file_path(file_id: str) -> Path:
@@ -48,8 +49,8 @@ def read_uploaded_file_rows(file_ids: object) -> tuple[list[dict[str, Any]], int
     """解析已上传文件并返回待写入数据库的记录和文件总字节数。
 
     CSV 会忽略表头及全空行；遇到带引号的单元格内换行时，仍把整条表格记录
-    当成一条样本。每条 CSV 样本的原始列值保留在 payload 顶层，文件名、行号
-    和内容指纹放在 payload._source 中，避免与用户列名混在一起。
+    当成一条样本。CSV 列值保留在 payload 顶层；空白参考标签按未标注处理，
+    污染参考标签转换为布尔值。文件名、行号和内容指纹放在 payload._source 中。
 
     TXT、JSON、XLSX、PDF 当前仍按文件保存为一条记录；XLSX/PDF 暂存整份文档，
     后续接入专用解析器后再拆分文档内部内容。
@@ -98,6 +99,16 @@ def read_uploaded_file_rows(file_ids: object) -> tuple[list[dict[str, Any]], int
                     row = {key: value for key, value in source_row.items()}
                     if not any(value is not None and str(value).strip() for value in row.values()):
                         continue
+                    if "reference_risk_level" in row and not (row["reference_risk_level"] or "").strip():
+                        del row["reference_risk_level"]
+                    if "reference_is_anomaly" in row:
+                        label = (row["reference_is_anomaly"] or "").strip()
+                        if not label:
+                            del row["reference_is_anomaly"]
+                        elif label in POLLUTION_LABELS:
+                            row["reference_is_anomaly"] = POLLUTION_LABELS[label]
+                        else:
+                            raise ValueError(f"CSV 第 {row_number} 行的污染参考标签只能填“污染”“未污染”")
                     canonical = json.dumps(
                         row, ensure_ascii=False, sort_keys=True, separators=(",", ":")
                     )

@@ -26,6 +26,8 @@ from app.routers import (
     kpis,
     data_resources,
     data_governance,
+    anomaly_reviews,
+    risk_dispositions,
     model_workbench,
     files,
     training_tasks,
@@ -267,6 +269,8 @@ app.include_router(
     prefix="/api/v1",
     tags=["数据治理"],
 )
+app.include_router(anomaly_reviews.router, prefix="/api/v1", tags=["异常治理复核"])
+app.include_router(risk_dispositions.router, prefix="/api/v1", tags=["风险复核与处置"])
 app.include_router(
     model_workbench.router,
     prefix="/api/v1",

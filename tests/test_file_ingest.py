@@ -96,6 +96,52 @@ class FileIngestTest(unittest.TestCase):
         self.assertEqual(rows[3]["content"], documents["file_third.json"].decode("utf-8"))
         self.assertEqual(byte_count, sum(len(raw) for raw in documents.values()))
 
+    def test_csv_risk_labels_can_mix_labeled_and_unlabeled_samples(self):
+        content = (
+            "id,text,reference_risk_level,topic_label\n"
+            "1,正常正文,safe,资料\n"
+            "2,提示正文,,\n"
+            "3,另一条提示正文,  ,资料\n"
+            "4,待核对标签,notice,资料\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            upload_dir = Path(temporary_directory)
+            (upload_dir / "file_mixed.csv").write_text(content, encoding="utf-8-sig")
+            (upload_dir / "file_unlabeled.csv").write_text(
+                "id,text,topic_label\n2,提示正文,\n", encoding="utf-8-sig",
+            )
+            with patch("app.services.file_ingest.UPLOAD_DIR", upload_dir):
+                rows, _ = read_uploaded_file_rows(["file_mixed", "file_unlabeled"])
+        self.assertEqual(len(rows), 5)
+        self.assertEqual(rows[0]["reference_risk_level"], "safe")
+        self.assertNotIn("reference_risk_level", rows[1])
+        self.assertNotIn("reference_risk_level", rows[2])
+        self.assertEqual(rows[3]["reference_risk_level"], "notice")
+        self.assertEqual(rows[1]["topic_label"], "")
+        self.assertEqual(rows[1]["_source"]["content_hash"], rows[4]["_source"]["content_hash"])
+
+    def test_csv_pollution_labels_are_imported_as_booleans(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            upload_dir = Path(temporary_directory)
+            (upload_dir / "file_pollution.csv").write_text(
+                "text,reference_is_anomaly,reference_risk_level\n"
+                "错标样本,污染,low\n"
+                "正常样本,未污染,safe\n"
+                "无标注样本,  ,\n",
+                encoding="utf-8-sig",
+            )
+            (upload_dir / "file_invalid.csv").write_text(
+                "text,reference_is_anomaly\n未知标签,待定\n", encoding="utf-8-sig",
+            )
+            with patch("app.services.file_ingest.UPLOAD_DIR", upload_dir):
+                rows, _ = read_uploaded_file_rows(["file_pollution"])
+                with self.assertRaisesRegex(ValueError, "第 2 行的污染参考标签"):
+                    read_uploaded_file_rows(["file_invalid"])
+        self.assertIs(rows[0]["reference_is_anomaly"], True)
+        self.assertIs(rows[1]["reference_is_anomaly"], False)
+        self.assertNotIn("reference_is_anomaly", rows[2])
+        self.assertEqual([row.get("reference_risk_level") for row in rows], ["low", "safe", None])
+
     def test_csv_rows_persist_as_records_and_new_version_references_full_snapshot(self):
         dataset_id = self.create_dataset()
         with tempfile.TemporaryDirectory() as temporary_directory:
