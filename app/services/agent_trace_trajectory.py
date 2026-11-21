@@ -117,10 +117,11 @@ def normalize_trajectory(record, file_id, index, raw, line, normalize):
             if not isinstance(body, dict):
                 body = {}
             status = source.get("tool_status") or d.get("status") or body.get("status")
-            from app.services.agent_trace_call_status import outcome
+            from app.services.agent_trace_call_status import outcome, command_from
             metadata = {k:source.get(k, d.get(k)) for k in ("execution_status", "permission_decision", "exit_code", "is_error", "success")}
             metadata.update(status=status, error_code=d.get("error_code") or body.get("error_code"))
-            c.update(**outcome(c.get("output_json"), metadata=metadata),
+            c.update(**outcome(c.get("output_json"), metadata=metadata, command=command_from(c["input_json"]), tool_name=c["tool_name"]),
+                outcome_metadata=metadata,
                 recorded_policy=source.get("policy") or d.get("policy"))
             for field in ("granted_scopes", "requested_scopes"):
                 scopes = d.get(field, source.get(field, []))

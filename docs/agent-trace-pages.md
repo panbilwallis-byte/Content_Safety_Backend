@@ -78,17 +78,83 @@ workspace 使用 `view=execution&include=options` 或 include=dashboard；列表
 
 沿用 agent_trace_export 任务、任务查询、下载票据及同源二进制下载。
 现在除 tools 外支持 ingest/statistics/execution，按页面协议验证 batch/filtered/sample 范围与内容。
-当前视图生成 JSON，结果包生成 ZIP，统计样本支持完整 JSON。ZIP 按请求包含标准化 JSON、离线HTML、证据索引、
+当前视图生成 JSON，结果包生成 ZIP，统计样本支持完整 JSON。除下述新版思维路径结果包外，ZIP 按请求包含标准化 JSON、离线HTML、证据索引、
 错误报告、统计摘要、CSV 和 manifest。执行页 JSON 聚焦选中样本，清单保存批次上下文与请求内容范围。
 产物冻结快照和选择，执行统一脱敏及包内一致匿名化；manifest 保存来源说明、范围及文件哈希。
 票据5分钟有效、产物24小时保留。轨迹审计不提供 PNG 导出，无需配置中文字体。
+
+### 思维路径：三个 JSON 文件的批次结果包
+
+真实 HTTP 模式下，思维路径页面的“导出结果包”继续发送现有
+`POST /tasks/execute` 请求：`capability_code=agent_trace_export`，
+`view=execution, export_kind=package, format=zip`。无需修改或重新构建前端。
+
+新建任务由服务端在 `Task.config.execution_package_version` 保存
+`execution-risk-package-v1`，生成 `agent-trace-execution.zip`，恰好包含：
+
+| 文件 | 内容 |
+| --- | --- |
+| `submission.json` | 与相同快照的批次报告接口一致的 JSON 数组，包含全部样本的 A1—C5 和 aggregate 汇总。 |
+| `first-risks.json` | 全部样本各自最早风险步骤的合并结果。 |
+| `all-risks.json` | 全部样本全部安全风险，按步骤分组、升序排列。 |
+
+三个文件使用 UTF-8、中文不转义、两空格缩进，保留原始轨迹编号和完整原文；
+不包含 manifest 或第四个文件。只对这个新任务分支使用原文导出，其他视图和
+单独 JSON 导出保持原有脱敏/匿名化策略。没有服务端版本标记的旧任务继续生成原有布局；
+旧产物不改写。客户端传入同名字段不能改变服务端版本选择。
+
+导出固定请求的批次与快照，始终覆盖整个批次，不受当前样本、分页、语言或风险筛选限制。
+即使前端保留了旧的 scope/contents 参数，服务端仍按三文件批次结果包执行；
+原请求结构及标识合法性继续校验。
+
+两个风险文件均为数组，每条记录只包含 `trajectory_id` 和 `B3`，没有 `results` 外层：
+
+```json
+[
+  {
+    "trajectory_id": "sample-1",
+    "B3": {
+      "指标": "思维链可视化质量③：首次风险行为步骤、片段和原文证据",
+      "risks": [
+        {
+          "step_id": 3,
+          "risk_quote": "已保存的命中片段",
+          "evidence": [{"step_id": 3, "quote": "已保存的完整原文证据"}]
+        }
+      ]
+    }
+  }
+]
+```
+
+`first-risks.json` 使用上述指标，`all-risks.json` 的指标固定为
+“第一/二/三次风险行为步骤、片段和原文证据”。无风险样本也保留，`risks=[]`；
+两个风险文件没有 aggregate。样本顺序和轨迹 ID 与 `submission.json` 共用同一构造逻辑，
+支持赛题、普通和混合批次。
+
+全部风险读取固定快照已经保存的安全发现和风险证据，不从首次风险报告反推，也不执行新规则。
+同一步的不同片段去重后用两个换行连接；证据按 `(step_id, quote)` 去重、保留首次出现顺序。
+优先使用已保存的完整 `source_evidence`，否则使用已保存命中片段，不补造原文。
+已明确驳回的证据排除；运行错误、重试和重复不算安全风险。
+缺少审计完成状态、发现集合或必要风险依据时任务失败并给出原因，不伪造空的成功结果。
+
+优先使用已保存赛题步骤；普通格式按页面的动作步骤映射。共享推理等不能唯一定位的内容，
+保留 `step_id=null`，按源事件分别分组并排在已定位步骤后；只有未定位风险时，
+首次风险文件取第一组未定位风险。缺失片段用空字符串、缺失证据用空列表，不生成解释替代证据。
+
+原文权限与导出权限在建单、执行、票据和下载时检查；执行时重新读取操作者当前状态及角色，
+下载还校验任务归属、来源授权、产物期限和 SHA-256。账号停用或降为只读后不能继续取得原文包。
+不修改数据库表结构，不升级风险规则，不重写历史快照。前端“示例演示”模式在浏览器生成 ZIP，
+仅修改后端不会改变该模式。
+
+验证：`uv run pytest tests/test_agent_trace_execution_package.py -q`。
 
 ## 使用与验证
 
 1. 重启后端并刷新前端，关闭“示例演示”。
 2. 接入页点击“新建批次”，上传文件，再点击“开始解析”。
 3. 其他三页沿用同一批次、快照和样本；无记录的字段显示未提供，未审计不等于无风险。
-4. JSON/ZIP 使用服务端冻结的快照和脱敏产物。
+4. JSON/ZIP 使用服务端冻结的快照；新版思维路径三文件 ZIP 保留原文，其他任务式导出默认脱敏。
 
 新增隔离数据库流程测试：tests/test_agent_trace_workflow.py、tests/test_agent_trace_trajectory.py。
 涵盖默认隐藏旧模拟来源、实际文件导入、字段保留、非首屏定位、重解析、审计证据和导出。

@@ -48,7 +48,7 @@ def test_exact_excerpts_leave_source_and_other_results_unchanged(reviewed_case):
     record, general, annotation, _ = reviewed_case
     saved = deepcopy(record)
     result = analyze(record)
-    assert result['analysis_version'] == 'competition-v4'
+    assert result['analysis_version'] == 'competition-v5'
     for key in reviewed.SECTIONS:
         assert result['results'][key] == annotation['results'][key]
         assert result['results'][key] != general[key]

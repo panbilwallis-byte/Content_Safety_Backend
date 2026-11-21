@@ -154,7 +154,8 @@ def aggregate(db, scope, params, user):
     calls_by_trace = {}
     for call in calls:
         calls_by_trace.setdefault(call["_trace_id"], []).append(call)
-    calls = [call for sample, _ in data for call in project_calls(project_statuses(calls_by_trace.get(sample.trace_id, [])))[0]]
+    calls = [call for sample, _ in data for call in project_calls(project_statuses(
+        calls_by_trace.get(sample.trace_id, []), sample.result.get("source_record")), sample.result.get("source_record"))[0]]
     risk = len(filtered(data, "risk"))
     missing = len(filtered(data, "missing_fields"))
     def metric(value, unit="count", valid=None):
@@ -277,6 +278,8 @@ def workspace(db, params, user):
 
 
 def normalized(db,scope,sample):
+    from app.services.agent_trace_call_status import project_calls
+    from app.services.agent_trace_duplicates import project_calls as project_duplicates
     raw_events = q.process_records(db,scope,sample.trace_id,TraceEvent)
     events, mapping, uncounted, counts = agent_trace_steps.project(sample, raw_events, sanitize=q.redact,
         reasoning_getter=q.original_reasoning, source_text_getter=q.recorded_event_text)
@@ -284,7 +287,9 @@ def normalized(db,scope,sample):
             "value_result":sample.result,"data_origin":sample.payload.get("data_origin"),
             "events":raw_events,"steps":events, **counts,
             "event_step_mapping":[{"source_event_id":source,"event_id":target} for source,target in mapping.items()],
-            "uncounted_source_events":uncounted,"calls":q.process_records(db,scope,sample.trace_id,TraceCall)}
+            "uncounted_source_events":uncounted,"calls":project_duplicates(project_calls(
+                q.process_records(db,scope,sample.trace_id,TraceCall),sample.result.get("source_record")),
+                sample.result.get("source_record"))[0]}
 
 
 def detail(db,scope,trace,params,user):

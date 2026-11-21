@@ -19,6 +19,8 @@ def tool_counts(calls):
 
 
 def ordinary_report(db, scope, sample, calls):
+    from app.services.agent_trace_call_status import project_calls
+    calls = project_calls(calls, sample.result.get("source_record"))
     payload = sample.payload
     if payload.get("data_origin") != "actual":
         q.fail(422, "当前快照含模拟轨迹，不能生成真实原文报告")
@@ -105,24 +107,20 @@ def ordinary_report(db, scope, sample, calls):
             unmatched.append({**location(event), "issue": "返回无法唯一配对", "content": q.recorded_event_text(event),
                               "evidence": evidence_for(event)})
 
-    for finding in payload.get("rule_findings", []):
-        category = finding.get("category")
-        if category != "operation":
-            continue
-        event = by_id.get(finding.get("event_id"))
-        call = calls_by_id.get(finding.get("call_id"))
-        item = {**location(event), "rule_id": finding.get("rule_id"), "issue": finding.get("label", MISSING),
-                "evidence": call_evidence(call) if call else evidence_for(event)}
-        item["error_type"] = finding.get("label", MISSING)
-        failures.append(item)
+    for call in calls:
+        for failure in call.get("execution_failures", []):
+            returned = by_id.get(call.get("return_event_id"))
+            failures.append({**location(by_id[call["event_id"]]), "error_type": failure["error_type"],
+                             "evidence": [{**location(returned), "quote": failure["quote"]}]})
 
-    for group in duplicate_groups(calls):
-        previous = calls_by_id[group["canonical_call_id"]]
-        for call_id in group["duplicate_call_ids"]:
+    for group in duplicate_groups(calls, sample.result.get("source_record")):
+        for pair in group["pairs"]:
+            call_id = pair["call_id"]
+            previous = calls_by_id[pair["previous_call_id"]]
             call = calls_by_id[call_id]
             repeats.append({**location(by_id[call["event_id"]]), "rule_id": "repeated_request",
                             "issue": group["reason"], "previous_step_id": location(by_id[previous["event_id"]])["step_id"],
-                            "evidence": call_evidence(previous) + call_evidence(call)})
+                            "evidence": call_evidence(previous) + call_evidence(call) + pair["context_evidence"]})
 
     issues = payload.get("issue_types", [])
     missing.extend({"field": code, "issue": label, "evidence": []} for code, label in (

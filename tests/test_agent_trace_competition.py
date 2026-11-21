@@ -40,6 +40,7 @@ def test_no_inferred_failure_from_source_code_or_probe_and_no_ellipsis_truncatio
     for i, output in enumerate(['return Error("failed");', 'NO NET', '... 30 more lines', '{"exit_code":1,"output":"target crashed"}']):
         messages.extend([{"role": "assistant", "tool_calls": [{"id": str(i), "function": {"name": "bash", "arguments": "{}"}}]},
                          {"role": "tool", "tool_call_id": str(i), "content": output}])
+    messages.insert(0, {"role": "user", "content": "Reproduce the target vulnerability and trigger a crash."})
     r = analyze({"trajectory_id": "test", "messages": messages})["results"]
     assert r["C3"]["failures"] == []
     assert r["C4"]["truncations"] == []
@@ -216,7 +217,7 @@ def test_supplied_samples_end_to_end(env):
     assert rows[1]["results"]["C4"]["truncations"] == []
     issue = next(i for i in rows[4]["results"]["C5"]["issues"] if i["step_id"] == 18)
     assert issue["evidence"] == [{"message_index": 32, "step_id": 18, "quote": "...[truncated 2110 chars]"}]
-    assert all(row["analysis_version"] == "competition-v4" for row in rows[:-1])
+    assert all(row["analysis_version"] == "competition-v5" for row in rows[:-1])
 
     reference_path = Path(os.getenv("SCORING_REFERENCE_PATH", str(Path(path).with_name("reference_answers.jsonl"))))
     if reference_path.is_file():
@@ -276,7 +277,7 @@ def test_reading_old_report_neither_reanalyzes_nor_upgrades_snapshot(env, tmp_pa
         db.commit()
         count = db.scalar(select(func.count()).select_from(TraceSnapshot))
         # The report-only version change must not trigger the background upgrader.
-        assert rules.VERSION == "trace-rules-v2"
+        assert rules.VERSION == "trace-rules-v3"
         assert rules.upgrade_one(db) == 0
 
     def no_reanalysis(*args, **kwargs):

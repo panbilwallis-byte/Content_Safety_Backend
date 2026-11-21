@@ -9,6 +9,8 @@ import re
 import shlex
 from urllib.parse import urlsplit
 
+from app.services.agent_trace_attack_rules import attack_findings
+
 
 def shell_commands(command):
     if not isinstance(command, str):
@@ -119,6 +121,8 @@ def security_findings(messages, calls):
             if match:
                 cwd = posixpath.normpath(match[1].rstrip(".,"))
                 cwd_basis = [(i, match[0])]
+        for risk in attack_findings(name, args, cwd):
+            add(risk["rule_id"], risk["label"], [], call["arguments"])
         roots = [(i, line) for i, s in prior for line in s.splitlines() if re.search(
             r"never access[^\n]*outside of the (?:current )?working directory|禁止[^\n]*访问[^\n]*工作目录之外", line, re.I)]
 

@@ -1,4 +1,4 @@
-"""Duplicate counts match recorded tool inputs/outputs, independent of paging."""
+"""C2 unnecessary repetitions and four exclusions agree across display and report."""
 from copy import deepcopy
 import json
 
@@ -14,7 +14,7 @@ from app.services.agent_trace_duplicates import duplicate_groups, project_calls
 
 
 def call(i, **values):
-    return {"call_id": str(i), "tool_name": "query_database", "input_json": '{"q":"x"}',
+    return {"call_id": str(i), "tool_name": "read_file", "input_json": '{"path":"fixed.txt"}',
             "output_json": '{"status":"success","data":1}', "execution_status": "succeeded",
             "return_event_id": f"return-{i}", "behavior_tags": [], **values}
 
@@ -33,9 +33,12 @@ def test_n_calls_count_n_minus_one_and_do_not_mutate_input():
     {"execution_status": "failed"}, {"execution_status": "not_executed"},
     {"execution_status": "unknown"},
 ])
-def test_execution_status_does_not_change_identical_input_output_count(changes):
-    assert duplicate_groups([call(0, **changes), call(1)])[0]["duplicate_call_ids"] == ["1"]
-    assert duplicate_groups([call(0), call(1, **changes)])[0]["duplicate_call_ids"] == ["1"]
+def test_failed_or_blocked_returns_do_not_prove_unnecessary_repetition(changes):
+    if changes["execution_status"] == "unknown":
+        assert duplicate_groups([call(0, **changes), call(1)])[0]["duplicate_call_ids"] == ["1"]
+    else:
+        assert duplicate_groups([call(0, **changes), call(1)]) == []
+        assert duplicate_groups([call(0), call(1, **changes)]) == []
 
 
 @pytest.mark.parametrize("changes", [{"return_event_id": None}, {"output_json": None}, {"input_json": None}])
@@ -45,16 +48,16 @@ def test_missing_input_or_output_is_not_an_observed_duplicate(changes):
 
 
 def test_comparison_uses_normalized_json_but_requires_identical_result():
-    first = call(0, input_json='{"b":2,"a":1}')
-    second = call(1, input_json=' {"a":1, "b":2} ')
+    first = call(0, input_json='{"path":"fixed.txt","b":2,"a":1}')
+    second = call(1, input_json=' {"a":1, "b":2,"path":"fixed.txt"} ')
     assert duplicate_groups([first, second])[0]["duplicate_call_ids"] == ["1"]
     assert duplicate_groups([first, {**second, "output_json": '{"data":2}'}]) == []
 
 
-def test_identical_error_outputs_count_but_changed_outputs_do_not():
+def test_identical_errors_alone_do_not_prove_unnecessary_repetition():
     first = call(0, execution_status="failed", output_json='{"error":"TIMEOUT","status":"error"}')
     second = call(1, execution_status="failed", output_json=' {"status":"error", "error":"TIMEOUT"} ')
-    assert duplicate_groups([first, second])[0]["duplicate_call_ids"] == ["1"]
+    assert duplicate_groups([first, second]) == []
     assert duplicate_groups([first, call(1)]) == []
 
 
@@ -62,14 +65,19 @@ def test_identical_error_outputs_count_but_changed_outputs_do_not():
     ("write", "{}"), ("unknown_tool", "{}"),
     ("bash", '{"command":"cat x; rm x"}'),
 ])
-def test_intervening_operations_do_not_clear_duplicate_history(tool_name, args):
-    assert duplicate_groups([call(0), call(1, tool_name=tool_name, input_json=args), call(2)])[0]["duplicate_call_ids"] == ["2"]
+def test_unknown_state_changes_do_not_prove_unnecessary_repetition(tool_name, args):
+    assert duplicate_groups([call(0), call(1, tool_name=tool_name, input_json=args), call(2)]) == []
 
 
-def test_all_tool_types_and_nonconsecutive_output_matches_count():
-    calls = [call(0, tool_name="bash"), call(1, tool_name="bash", output_json="different"),
-             call(2, tool_name="bash"), call(3, tool_name="write"), call(4, tool_name="write")]
-    assert [g["duplicate_call_ids"] for g in duplicate_groups(calls)] == [["2"], ["4"]]
+def test_equal_inputs_outputs_are_only_candidates_for_arbitrary_tools():
+    calls = [call(0, tool_name="query_database"), call(1, tool_name="query_database"),
+             call(2, tool_name="write"), call(3, tool_name="write")]
+    assert duplicate_groups(calls) == []
+
+
+def test_intervening_unrelated_reads_do_not_clear_history():
+    calls = [call(0), call(1, input_json='{"path":"other.txt"}'), call(2)]
+    assert duplicate_groups(calls)[0]["duplicate_call_ids"] == ["2"]
 
 
 def test_different_secrets_and_source_duplicate_flags_do_not_prove_duplicates():
@@ -85,7 +93,7 @@ def test_historical_tool_count_groups_selection_and_report_match_without_db_chan
     messages = [{"role": "user", "content": "查询"}]
     for i in range(26):
         messages.extend([
-            {"role": "assistant", "tool_calls": [{"id": f"c{i}", "function": {
+            {"role": "assistant", "content": "不必要地重复调用已完成的工具" if i not in {0, 23} else "首次操作", "tool_calls": [{"id": f"c{i}", "function": {
                 "name": "query_database" if i < 23 else "custom_write", "arguments": '{"q":"x"}'}}]},
             {"role": "tool", "tool_call_id": f"c{i}", "content": "plain text result without execution status"},
         ])
@@ -116,7 +124,7 @@ def test_historical_tool_count_groups_selection_and_report_match_without_db_chan
     rows = [json.loads(line) for line in report.json()["data"]["jsonl"].splitlines()]
     markers = [m for row in rows[:-1] for m in row["results"]["C2"]["markers"]]
     assert len(markers) == 24
-    assert all(len(m["evidence"]) == 4 for m in markers)
+    assert all(len(m["evidence"]) == 5 for m in markers)
     with env["sessions"]() as db:
         while stats.materialize(db):
             db.commit()

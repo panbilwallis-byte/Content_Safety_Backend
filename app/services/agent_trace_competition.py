@@ -7,7 +7,7 @@ from copy import deepcopy
 import json
 import re
 
-VERSION = "competition-v4"
+VERSION = "competition-v5"
 MISSING = "未提供"
 NAMES = {
     "A1": "数据统计指标可视化①：输入、输出token数",
@@ -45,51 +45,19 @@ def first_risk(risks):
     return [result]
 
 
-def execution_failures(call, command):
-    """Classify explicit runtime diagnostics, retaining their exact return location."""
-    from app.services.agent_trace_security import shell_commands
-    downloads = False
-    for tokens in shell_commands(command):
-        if tokens[0].rsplit("/", 1)[-1] != "curl":
-            continue
-        for i, token in enumerate(tokens[1:], 1):
-            if token in {"-O", "--remote-name"}:
-                downloads = True
-            if token in {"-o", "--output"} and i + 1 < len(tokens):
-                downloads |= tokens[i + 1] not in {"/dev/null", "-"}
-            elif token.startswith("--output="):
-                downloads |= token.split("=", 1)[1] not in {"/dev/null", "-"}
-    rules = [
-        (r"^User aborted the command$", "执行被用户中止"),
-        (r"^curl:\s*\(23\).*Failure writing output", "输出写入失败"),
-        (r"^curl:\s*\(28\)", "下载超时" if downloads else "网络请求超时"),
-        (r"^NO NET \(exit 28\)$", "网络请求超时"),
-        (r"^Command exited with code 124$", "执行超时"),
-        (r"^(?:/usr)?(?:/bin/)?(?:ba)?sh:.*command not found", "命令不存在"),
-        (r"^(?:/usr)?(?:/bin/)?(?:ba)?sh:.*No such file|^Error:.*(?:403|404)", "命令或请求失败"),
-        (r"^(?:tool|command|operation)\b.*timed out|^execution\b.*timeout", "工具超时"),
-        (r"^Traceback \(most recent call last\):$", "运行异常"),
-    ]
+def execution_failures(call, command, messages=()):
+    """C3 diagnostics and evidence use the same outcome rules as tool cards."""
+    from app.services.agent_trace_call_status import outcome, task_instructions, METADATA_FIELDS
     found = {}
     for returned in call["returns"]:
-        output = text(returned["content"])
-        fenced = False
-        for line in output.splitlines():
-            if line.lstrip().startswith("```"):
-                fenced = not fenced
-                continue
-            if fenced:
-                continue
-            for pattern, error in rules:
-                if error == "运行异常" and "blocked for fallback test" in output:
-                    continue
-                if re.search(pattern, line.strip(), re.I):
-                    item = {"step_id": call["step_id"], "message_index": returned["message_index"], "quote": line}
-                    evidence = found.setdefault(error, [])
-                    if item not in evidence:
-                        evidence.append(item)
-                    break
-    # Nonzero exit codes alone (including requested target crashes) are insufficient.
+        index = returned.get("message_index")
+        message = messages[index] if type(index) is int and 0 <= index < len(messages) else {}
+        metadata = {k:message[k] for k in METADATA_FIELDS if k in message}
+        value = outcome(returned["content"], metadata=metadata, command=command,
+                        instructions=task_instructions({"messages": messages}), tool_name=call.get("tool_name") or "")
+        for failure in value["execution_failures"]:
+            item = {"step_id": call["step_id"], "message_index": index, "quote": failure["quote"]}
+            found.setdefault(failure["error_type"], []).append(item)
     return [{"step_id": call["step_id"], "error_type": error, "evidence": evidence}
             for error, evidence in found.items()]
 
@@ -156,19 +124,45 @@ def parse(record):
     return calls, segments, absent, unmatched, missing, locations
 
 
+def project_report_failures(row, record):
+    """Update only C3 and its C5 evidence for old snapshots; leave saved risk audits intact."""
+    from app.services.agent_trace_call_status import command_from
+    failures = [failure for call in parse(record)[0]
+                for failure in execution_failures(call, command_from(call.get("arguments")), record["messages"])]
+    if row["results"]["C3"]["failures"] == failures:
+        return
+    row["results"]["C3"]["failures"] = failures
+    issues = row["results"]["C5"]["issues"]
+    row["results"]["C5"]["issues"] = ([i for i in issues if i.get("source_subitem") == "C2"]
+        + [{"source_subitem": "C3", **failure} for failure in failures]
+        + [i for i in issues if i.get("source_subitem") not in {"C2", "C3"}])
+
+
+def project_report_duplicates(row, record):
+    """Old snapshots use the same C2 pairs as cards; keep reviewed quotes when valid."""
+    from app.services.agent_trace_duplicates import competition_markers
+    markers = competition_markers(parse(record)[0], record)
+    saved = row["results"]["C2"]["markers"]
+    if (all(m.get("evidence") for m in saved) and
+        [(m["previous_step_id"], m["step_id"]) for m in markers] == [(m["previous_step_id"], m["step_id"]) for m in saved]):
+        return
+    row["results"]["C2"]["markers"] = markers
+    issues = row["results"]["C5"]["issues"]
+    row["results"]["C5"]["issues"] = ([{"source_subitem": "C2", **marker} for marker in markers]
+        + [i for i in issues if i.get("source_subitem") != "C2"])
+
+
 def analyze(record, *, apply_annotations=True):
     calls, segments, absent, unmatched, missing, locations = parse(record)
     messages = record["messages"]
     counts = Counter(c["tool_name"] for c in calls if isinstance(c["tool_name"], str))
     def evidence(i, quote):
         return {"message_index": i, **({"step_id": locations[i][0]} if i in locations else {}), "quote": quote}
-    def call_evidence(c):
-        return [{"step_id": c["step_id"], "message_index": c["message_index"], "quote": text(c["arguments"])}] + [
-            {"step_id": c["step_id"], **r, "quote": text(r["content"])} for r in c["returns"]]
     from app.services.agent_trace_security import security_findings
     risks = first_risk(security_findings(messages, calls))
     failures, repeats, truncations = [], [], []
-    history = {}
+    from app.services.agent_trace_duplicates import competition_markers
+    repeats = competition_markers(calls, record)
     for c in calls:
         args = text(c["arguments"])
         try:
@@ -176,17 +170,7 @@ def analyze(record, *, apply_annotations=True):
         except (ValueError, TypeError):
             decoded = {}
         command = decoded.get("command", decoded.get("cmd", "")) if isinstance(decoded, dict) else ""
-        outputs = "\n".join(text(r["content"]) for r in c["returns"])
-        failures.extend(execution_failures(c, command))
-        key = (c["tool_name"], args)
-        previous = history.get(key)
-        # A successful read repeated without any intervening mutation is redundant.
-        readonly = c["tool_name"] in {"read", "grep", "ls"} or bool(re.fullmatch(r"(?:sed|cat|head|ls)\s+[^;&|]+", command))
-        if previous and readonly and previous["returns"] and outputs == "\n".join(text(r["content"]) for r in previous["returns"]):
-            repeats.append({"step_id": c["step_id"], "previous_step_id": previous["step_id"], "evidence": call_evidence(previous) + call_evidence(c)})
-        if c["tool_name"] in {"write", "edit", "apply_patch"} or (command and not readonly):
-            history.clear()
-        history[key] = c
+        failures.extend(execution_failures(c, command, messages))
     # Only explicit recording/transport truncation, not ellipses or head/limit usage.
     pattern = re.compile(r"\[.*?truncated.*?\]|(?:output|content|response) (?:has been |was |is )?truncated|image will be omitted|content omitted|内容省略|内容截断", re.I)
     for i, m in enumerate(messages):
@@ -236,10 +220,11 @@ def analyze(record, *, apply_annotations=True):
     return {"trajectory_id": record.get("trajectory_id"), "analysis_version": VERSION, "results": result}
 
 
-def report(db, scope, user):
+def report_rows(db, scope, user):
+    """Share sample order and collision-safe identities with batch ZIP exports."""
     from sqlalchemy import select
     from app.models.agent_traces import TraceSample, TraceCall
-    from app.services.agent_trace_batch_report import ordinary_report, tool_counts, VERSION as ORDINARY_VERSION
+    from app.services.agent_trace_batch_report import ordinary_report, tool_counts
     from app.services import agent_trace_query as q
     if not q.permissions(user)["can_view_raw"]:
         q.fail(403, "赛题报告包含完整原文，需要原文查看权限")
@@ -264,6 +249,8 @@ def report(db, scope, user):
             row = deepcopy(sample.payload.get("competition_report"))
             if not row:
                 q.fail(409, "当前快照缺少赛题分析结果，请等待规则升级或重新解析")
+            project_report_failures(row, record)
+            project_report_duplicates(row, record)
             identity = record["trajectory_id"]
         else:
             row = ordinary_report(db, scope, sample, calls)
@@ -279,7 +266,13 @@ def report(db, scope, user):
         counts.update(per_tool)
     aggregate = {"trajectory_id": "aggregate", "results": {"A4": {"指标": NAMES["A4"],
                  "trajectory_ids": [r["trajectory_id"] for r in rows], "tool_calls": sum(counts.values()), "tool_counts": dict(counts)}}}
-    versions = {r.get("analysis_version", "competition-v1") for r in rows}
-    return {"jsonl": "\n".join(json.dumps(r, ensure_ascii=False) for r in [*rows, aggregate]) + "\n",
+    return samples, [*rows, aggregate]
+
+
+def report(db, scope, user):
+    from app.services.agent_trace_batch_report import VERSION as ORDINARY_VERSION
+    _, rows = report_rows(db, scope, user)
+    versions = {r.get("analysis_version", "competition-v1") for r in rows[:-1]}
+    return {"jsonl": "\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n",
             "analysis_version": next(iter(versions)) if len(versions) == 1 else ORDINARY_VERSION,
             "notice": "基于固定快照的已保存原文与审计结果；普通轨迹步骤采用事件序号，缺失信息不补造；未命中不代表全面安全"}

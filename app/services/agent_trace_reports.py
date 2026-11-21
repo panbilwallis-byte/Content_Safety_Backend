@@ -32,7 +32,11 @@ def export_rows(db,scope,data):
     return rows
 
 
-def validate(db,data,user):
+def validate(db,data,user,*,execution_package=False):
+    if execution_package:
+        from app.services.agent_trace_execution_package import authorize, requested
+        if not requested(data):q.fail(422,"原文结果包类型无效")
+        user=authorize(db,user)
     if not q.permissions(user)["can_export"]:q.fail(403,"当前账号不能导出")
     view=data.get("view")
     if view not in {"ingest","statistics","execution"}:q.fail(422,"轨迹导出视图无效")
@@ -48,7 +52,10 @@ def validate(db,data,user):
     if not isinstance(ids,list) or len(ids)>100 or any(not isinstance(i,str) for i in ids):q.fail(422,"样本标识列表无效")
     if spec["type"]=="sample" and len(ids)!=1:q.fail(422,"sample范围要求一个样本")
     if kind=="sample_json" and spec["type"]!="sample":q.fail(422,"完整样本JSON要求sample范围")
-    if data.get("redaction_profile","standard")!="standard" or data.get("anonymize_ids",True) is not True:q.fail(422,"要求standard脱敏和匿名化")
+    if execution_package:
+        if data.get("redaction_profile","standard") not in ("standard","none") or type(data.get("anonymize_ids",True)) is not bool:
+            q.fail(422,"结果包脱敏参数无效")
+    elif data.get("redaction_profile","standard")!="standard" or data.get("anonymize_ids",True) is not True:q.fail(422,"要求standard脱敏和匿名化")
     contents=data.get("contents")
     allowed={"normalized_json"} if kind in {"view","sample_json"} else {
         "normalized_json","evidence_index","manifest","offline_html","error_report", "stats_summary","sample_table"}
@@ -60,6 +67,8 @@ def validate(db,data,user):
     if view=="statistics":params.setdefault("projection_version",stats.VERSION)
     _,scope=q.resolve(db,data["batch_id"],params)
     frozen={**data,**scope,"redaction_profile":"standard","anonymize_ids":True}
+    if execution_package:
+        frozen.update(scope={"type":"batch","trace_ids":[]},redaction_profile="none",anonymize_ids=False)
     selected=export_rows(db,scope,frozen)
     if data.get("selected_trace_id"):
         row=q.get_sample(db,scope,data["selected_trace_id"])
@@ -88,7 +97,9 @@ def build(db,task):
     for row in rows:
         value=stats.normalized(db,scope,row)
         summary = q.execution_summary(row) if data["view"] in {"execution", "statistics"} else q.sample_summary(row)
-        document["samples"].append({**value,"summary":summary,"data_origin":row.payload.get("data_origin","actual"), **q.rule_audit_projection(row.payload)})
+        from app.services.agent_trace_duplicates import project_audit as project_duplicate_audit
+        audit = q.rule_audit_projection(project_duplicate_audit(row.payload, value["calls"], row.result.get("source_record")))
+        document["samples"].append({**value,"summary":{**summary, **audit},"data_origin":row.payload.get("data_origin","actual"), **audit})
     if data["view"]=="statistics":document["statistics"]=stats.aggregate(db,scope,{"language":data["scope"].get("language",data.get("language","all"))},{"uid":task.config["owner_id"]})
     document["errors"]=[b.payload.get("error_examples",[]) for b in db.scalars(select(TraceBinding).where(TraceBinding.batch_id==scope["batch_id"]))]
     document=anonymize(document,task.task_id,rows[0] if rows else None)

@@ -359,10 +359,12 @@ def normalize(record,file_id,index,raw,line,override):
         e=event("tool_result","tool",output,path)
         c=pending.pop(source_id,None)
         if not c:issues.append("call_unlinked");return
-        from app.services.agent_trace_call_status import outcome
-        parsed_status = outcome(output, metadata=metadata, error=error)
+        from app.services.agent_trace_call_status import outcome, command_from, task_instructions
+        metadata = {**(metadata or {}), **({"is_error": True} if error else {})}
+        parsed_status = outcome(output, metadata=metadata, command=command_from(c["input_json"]),
+                                instructions=task_instructions(record), tool_name=c["tool_name"])
         c.update(return_event_id=e["event_id"],output_json=output if isinstance(output,str) else dumps(output),output_summary=str(output)[:512],
-            **parsed_status)
+            outcome_metadata=metadata, **parsed_status)
         e["call_id"]=c["call_id"];c["evidence_chain"].append({"event_id":e["event_id"],"display_id":e["display_id"]})
     if fmt=="langchain_trace":
         runs=record["runs"]

@@ -190,11 +190,19 @@ def test_long_json_chunks_utf8_version_and_scope(pages):
 
 @pytest.mark.parametrize("view",["ingest","statistics","execution"])
 @pytest.mark.parametrize("kind",["view","package"])
-def test_three_page_exports(pages,view,kind):
+def test_three_page_exports(pages,view,kind,tmp_path):
     scope={**pages["scope"],"projection_version":stats.VERSION if view=="statistics" else pages["scope"]["projection_version"]}
+    trace=pages["trace"]
+    if view=="execution" and kind=="package":
+        # New execution packages contain raw actual batches, not generated fixtures.
+        from test_agent_trace_workflow import upload as upload_records
+        bid,_=upload_records(pages,tmp_path,[{"trajectory_id":"plain","messages":[{"role":"assistant","content":"done"}]}])
+        with pages["sessions"]() as db:
+            _,scope=q.resolve(db,bid,{})
+            trace=db.scalar(select(TraceSample).where(TraceSample.snapshot_id==scope["snapshot_id"])).trace_id
     contents=["normalized_json"] if kind=="view" else ["normalized_json","offline_html","evidence_index","manifest"]
     command={"capability_code":"agent_trace_export","input":{**scope,"view":view,"export_kind":kind,"format":"json" if kind=="view" else "zip",
-        "selected_trace_id":pages["trace"],"scope":{"type":"sample","trace_ids":[pages["trace"]]},"contents":contents}}
+        "selected_trace_id":trace,"scope":{"type":"sample","trace_ids":[trace]},"contents":contents}}
     r=post(pages,"/api/v1/tasks/execute",command)
     assert r.status_code==200,r.text
     task=pages["client"].get("/api/v1/tasks/"+r.json()["data"]["task_id"]).json()["data"]
@@ -206,8 +214,12 @@ def test_three_page_exports(pages,view,kind):
     if kind=="view":assert file.json()["view"] == view
     else:
         with zipfile.ZipFile(io.BytesIO(file.content)) as z:
-            assert "report.html" in z.namelist()
-            assert pages["trace"] not in z.read("normalized.json").decode()
+            if view=="execution":
+                assert z.namelist()==["submission.json","first-risks.json","all-risks.json"]
+                assert json.loads(z.read("first-risks.json"))[0]["B3"]["risks"]==[]
+            else:
+                assert "report.html" in z.namelist()
+                assert pages["trace"] not in z.read("normalized.json").decode()
 
 
 def test_statistics_full_sample_json_export(pages):

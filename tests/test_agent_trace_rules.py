@@ -25,7 +25,7 @@ def test_errors_retries_and_duplicate_requests_are_not_security():
     p, evidence = evaluate(r)
     assert p["audit_decision"] == "no_risk_found"
     assert p["rule_audit"]["operation_count"] == 1
-    assert p["rule_audit"]["efficiency_count"] == 2
+    assert p["rule_audit"]["efficiency_count"] == 1  # retry retained; source duplicate flag alone is not C2 evidence
     assert p["rule_audit"]["unknown_permission_call_count"] == 1
     assert evidence == []
 

@@ -44,6 +44,9 @@ def owner_task(db, task_id, user):
         fail(404, "导出任务不存在")
     if str(task.config.get("owner_id")) != str(user["uid"]):
         fail(403, "没有访问此导出任务的权限")
+    from app.services.agent_trace_execution_package import enabled, authorize
+    if enabled(task):
+        authorize(db, user)
     if task.capability_code == "agent_trace_ingest":
         from app.models.agent_traces import TraceBatch
         batch = db.get(TraceBatch, task.input_data["batch_id"])
@@ -54,10 +57,10 @@ def owner_task(db, task_id, user):
     return task
 
 
-def validate_input(db, data, user):
+def validate_input(db, data, user, *, execution_package=False):
     if data.get("view") in {"ingest", "statistics", "execution"}:
         from app.services.agent_trace_reports import validate
-        return validate(db, data, user)
+        return validate(db, data, user, execution_package=execution_package)
     if not permissions(user)["can_export"]:
         fail(403, "当前账号不能导出")
     if data.get("view") != "tools":
@@ -101,7 +104,9 @@ def validate_input(db, data, user):
 
 
 def create_task(db, data, user, key, name=None):
-    frozen = validate_input(db, data, user)  # Authorization is checked on every replay.
+    from app.services.agent_trace_execution_package import requested, VERSION as PACKAGE_VERSION
+    execution_package = requested(data)
+    frozen = validate_input(db, data, user, execution_package=execution_package)  # Recheck on replay.
     identity = idem_key(user["uid"], "/tasks/execute", key)
     digest = hashlib.sha256(json.dumps({"input": data, "name": name}, sort_keys=True,
                                       ensure_ascii=False, allow_nan=False).encode()).hexdigest()
@@ -119,9 +124,12 @@ def create_task(db, data, user, key, name=None):
     try:
         db.add(record)
         db.flush()
+        config = {"owner_id": str(user["uid"]), "role": user.get("role", ""), "tier": user.get("tier", "operator")}
+        if execution_package:
+            config["execution_package_version"] = PACKAGE_VERSION
         task = Task(task_id=task_id, name=name or "工具交互导出", capability_code="agent_trace_export",
             status="pending", progress=0, input_data=frozen,
-            config={"owner_id": str(user["uid"]), "role": user.get("role", ""), "tier": user.get("tier", "operator")},
+            config=config,
             source_name="工具交互", result={"kind": "agent_trace_export", "batch_id": frozen["batch_id"],
                                          "snapshot_id": frozen["snapshot_id"], "artifacts": []})
         db.add(task)
@@ -171,6 +179,9 @@ def anonymize(document, seed, sample=None):
 
 
 def build_artifact(db, task):
+    from app.services.agent_trace_execution_package import enabled, build
+    if enabled(task):
+        return build(db, task)
     if task.input_data.get("view") != "tools":
         from app.services.agent_trace_reports import build
         return build(db, task)
@@ -178,9 +189,14 @@ def build_artifact(db, task):
     batch, scope = resolve(db, data["batch_id"], data)
     trace = data["selected_trace_id"]
     sample = get_sample(db, scope, trace)
+    from app.services.agent_trace_duplicates import project_calls as project_duplicates, project_audit as project_duplicate_audit
+    from app.services.agent_trace_call_status import project_calls as project_statuses
+    calls, _ = project_duplicates(project_statuses(process_records(db, scope, trace, TraceCall),
+        sample.result.get("source_record")), sample.result.get("source_record"))
+    audit = query.rule_audit_projection(project_duplicate_audit(sample.payload, calls, sample.result.get("source_record")))
     document = {"scope": scope, "sample": {**query.sample_summary(sample), "source": sample.payload["source"]},
         "value_result": sample.result, "events": process_records(db, scope, trace, TraceEvent),
-        "calls": process_records(db, scope, trace, TraceCall),
+        "calls": calls, **audit,
         "evidence": [r.payload for r in db.scalars(select(TraceEvidence).where(
             TraceEvidence.snapshot_id == scope["snapshot_id"], TraceEvidence.trace_id == trace,
             TraceEvidence.projection_version == scope["projection_version"]))]}
@@ -220,7 +236,8 @@ def run_export(task_id, sessions=SessionLocal):
         task = db.get(Task, task_id)
         try:
             user = {"uid": task.config["owner_id"], "tier": task.config.get("tier", "operator")}
-            validate_input(db, task.input_data, user)
+            from app.services.agent_trace_execution_package import enabled
+            validate_input(db, task.input_data, user, execution_package=enabled(task))
             body, filename, mime = build_artifact(db, task)
             aid = "art_" + uuid4().hex
             storage_name = aid + (".json" if mime == "application/json" else ".zip")
