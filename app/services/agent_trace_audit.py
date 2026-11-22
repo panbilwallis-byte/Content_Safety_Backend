@@ -1,4 +1,4 @@
-"""Preserve producer-declared audit results; do not infer risk from test labels."""
+"""Preserve producer-declared audit results and add trajectory risk judgments."""
 from app.services.agent_trace_generation import stable_id
 
 
@@ -54,3 +54,59 @@ def recorded_audit(record, payload, events, calls):
         target["risk_level"] = severity
     payload["risk_types"] = list({r["risk_type"]["code"]: r["risk_type"] for r in rows}.values())
     return rows
+
+
+def has_located_model_findings(payload):
+    return any(finding.get("detection_source") == "model_fallback" and finding.get("event_id")
+               for finding in (payload.get("rule_findings") or []))
+
+
+def apply_model_audit(payload, trace, metadata, events, evidence):
+    payload["model_audit"] = {k: v for k, v in metadata.items() if k not in {"risk_quote", "source_evidence"}}
+    ordinal = metadata.get("risk_event_ordinal")
+    event = next((item for item in events if item["ordinal"] == ordinal), None)
+    quote, source = metadata.get("risk_quote"), metadata.get("source_evidence")
+    if not metadata.get("risk_detected") or event is None or not quote or not source:
+        return
+
+    risk_type = {"code": "other", "label": "其他风险"}
+    payload["audit_decision"] = "risk_found"
+    if payload["risk_level"] == "none":
+        payload["risk_level"] = "unknown"
+    if all(item["code"] != risk_type["code"] for item in payload["risk_types"]):
+        payload["risk_types"].append(risk_type)
+
+    finding = {
+        "finding_id": stable_id("finding_", metadata["version"], trace),
+        "rule_id": "other", "rule_version": metadata["version"], "risk_type": risk_type,
+        "scope": "trace", "category": "security", "label": "模型判定有风险",
+        "event_id": None, "event_display_id": None, "call_id": None,
+        "severity": "unknown", "outcome": "model_judgment", "evidence_text": "", "source_evidence": [],
+        "detection_source": "model_fallback", "model_provider": metadata["provider"], "model_id": metadata["model"],
+    }
+    payload["rule_findings"].append(finding)
+    payload["rule_audit"]["security_count"] += 1
+    report = payload.get("competition_report")
+    if report:
+        report["results"]["B2"]["judgment"] = "有风险"
+    from app.services.agent_trace_competition import first_risk
+
+    ref = event.get("source_ref") or {}
+    coordinates = {key: ref[key] for key in ("competition_step", "message_index", "call_index") if key in ref}
+    step = coordinates.get("competition_step", event["ordinal"])
+    finding.update(coordinates, scope="event", event_id=event["event_id"], event_display_id=event["display_id"],
+                   call_id=event.get("call_id"), evidence_text=quote, source_evidence=source, source_ref=ref)
+    evidence.append({**coordinates, "evidence_id": finding["finding_id"], "event_id": event["event_id"],
+                     "risk_type": risk_type, "match_pattern": quote, "severity": "unknown",
+                     "rule_id": "other", "rule_version": metadata["version"], "policy_version": metadata["version"],
+                     "review_status": "pending", "confidence": None, "confidence_kind": "unknown",
+                     "related_call_ids": [event["call_id"]] if event.get("call_id") else [],
+                     "data_origin": "actual", "detection_source": "model_fallback", "source_evidence": source})
+    payload["risk_steps"] = sorted({*payload["risk_steps"], step})
+    payload["first_risk_step"] = payload["risk_steps"][0]
+    if report and "competition_step" in ref:
+        b3 = report["results"]["B3"]
+        model_risk = {"step_id": step, "rule_id": "other", "risk_quote": quote,
+                      "event_id": event["event_id"], "call_id": event.get("call_id"), "evidence": source}
+        risks = first_risk([*b3["risks"], model_risk])
+        b3.update(risks=risks, first_risk_step=risks[0]["step_id"])

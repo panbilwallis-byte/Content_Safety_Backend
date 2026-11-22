@@ -224,6 +224,7 @@ def report_rows(db, scope, user):
     """Share sample order and collision-safe identities with batch ZIP exports."""
     from sqlalchemy import select
     from app.models.agent_traces import TraceSample, TraceCall
+    from app.services.agent_trace_audit import has_located_model_findings
     from app.services.agent_trace_batch_report import ordinary_report, tool_counts
     from app.services import agent_trace_query as q
     if not q.permissions(user)["can_view_raw"]:
@@ -249,8 +250,9 @@ def report_rows(db, scope, user):
             row = deepcopy(sample.payload.get("competition_report"))
             if not row:
                 q.fail(409, "当前快照缺少赛题分析结果，请等待规则升级或重新解析")
-            project_report_failures(row, record)
-            project_report_duplicates(row, record)
+            if not has_located_model_findings(sample.payload):
+                project_report_failures(row, record)
+                project_report_duplicates(row, record)
             identity = record["trajectory_id"]
         else:
             row = ordinary_report(db, scope, sample, calls)

@@ -97,8 +97,7 @@ def build(db,task):
     for row in rows:
         value=stats.normalized(db,scope,row)
         summary = q.execution_summary(row) if data["view"] in {"execution", "statistics"} else q.sample_summary(row)
-        from app.services.agent_trace_duplicates import project_audit as project_duplicate_audit
-        audit = q.rule_audit_projection(project_duplicate_audit(row.payload, value["calls"], row.result.get("source_record")))
+        audit = q.tool_audit_projection(row, value["calls"])
         document["samples"].append({**value,"summary":{**summary, **audit},"data_origin":row.payload.get("data_origin","actual"), **audit})
     if data["view"]=="statistics":document["statistics"]=stats.aggregate(db,scope,{"language":data["scope"].get("language",data.get("language","all"))},{"uid":task.config["owner_id"]})
     document["errors"]=[b.payload.get("error_examples",[]) for b in db.scalars(select(TraceBinding).where(TraceBinding.batch_id==scope["batch_id"]))]

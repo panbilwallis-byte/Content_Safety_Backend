@@ -142,6 +142,22 @@ def contexts(calls, record):
     return source
 
 
+def expected_repeat(call, purpose):
+    """Recognize an explicitly necessary call before checking for redundancy."""
+    args = arguments(call)
+    return (bool(POLLING.search(call.get("tool_name") or "") or EXCLUDED_PURPOSE.search(purpose))
+            or any(args.get(k) is True or args.get(k) in ("true", "enabled")
+                   for k in ("poll", "polling", "follow", "watch", "wait_for_completion"))
+            or any(tag.get("code") == "retry" for tag in call.get("behavior_tags", [])))
+
+
+def changes_state(call):
+    args = arguments(call)
+    return bool(MUTATION.search(call.get("tool_name") or "") or
+                re.search(r"\b(?:rm|mv|cp|touch|mkdir|git\s+(?:checkout|reset|pull)|sed\s+-i)\b|>{1,2}",
+                          str(args.get("command", args.get("cmd", "")))))
+
+
 def duplicate_pairs(calls, record=None):
     """Return prior/current indices with evidence; exclusions always win."""
     source = contexts(calls, record)
@@ -159,10 +175,7 @@ def duplicate_pairs(calls, record=None):
         context = "\n".join(p["quote"] for p in purpose)
         # A source retry label is supporting evidence of necessity, never
         # supporting evidence of unnecessary repetition.
-        if (POLLING.search(call.get("tool_name") or "") or EXCLUDED_PURPOSE.search(context)
-                or any(arguments(call).get(k) is True or arguments(call).get(k) in ("true", "enabled")
-                       for k in ("poll", "polling", "follow", "watch", "wait_for_completion"))
-                or any(t.get("code") == "retry" for t in call.get("behavior_tags", []))):
+        if expected_repeat(call, context):
             continue
         between = calls[previous_index + 1:index]
         # Unknown effects may change state. Do not infer unchanged state through
@@ -173,9 +186,7 @@ def duplicate_pairs(calls, record=None):
                        and all(file_read(c) is not None for c in between))
         # Positive intent evidence also works for arbitrary tool types. Changes
         # explicitly made between calls still invalidate that justification.
-        if explicit and any(MUTATION.search(c.get("tool_name") or "") or
-                            re.search(r"\b(?:rm|mv|cp|touch|mkdir|git\s+(?:checkout|reset|pull)|sed\s+-i)\b|>{1,2}",
-                                      str(arguments(c).get("command", arguments(c).get("cmd", "")))) for c in between):
+        if explicit and any(changes_state(c) for c in between):
             continue
         # For general tools equality alone is insufficient. Static reads provide
         # additional evidence: same recorded file, contents already available,

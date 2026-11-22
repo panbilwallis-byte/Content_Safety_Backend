@@ -56,6 +56,35 @@ LangChain 按根运行拆分，缺父节点或循环引用拒绝；工具调用�
 原记录文本保留。有效记录可部分发布；全部失败保留旧快照，增量解析保留未重解析文件的样本。
 统计补算故障不会改写已发布的解析成功状态，后续由同步器继续处理。
 
+### 模型补查与联调
+
+在上传解析任务的 input 中填写可选的 audit_strategy。省略或填 default 时仅运行平台规则。
+选择 deepseek-4.1-flash 时用 DeepSeek 补查，选择 internlm-9b 时用书生补查。每条轨迹先运行规则，
+规则先审计整批并分段持久化，暂存快照不可查询或导出。模型随后读取完整的规则结果，
+返回 JSON 结论、步骤号、片段编号及逐字引文。原文核验通过的风险标为 other。
+整批补查完成才发布合并快照；模型不可用或补查未完成时发布规则快照。
+自任务受理开始计时，22 小时 55 分钟停止等待审计，预留 5 分钟发布。独立检查器可以在
+模型请求仍等待时发布规则快照；规则阶段到点则发布已持久化的部分。
+页面在发布前继续读取既有快照，截止原因和实际完成数量留在后台快照元数据。
+工具失败及重复调用仍由平台规则判定。
+
+后端通过 .env 或容器运行时环境变量接收以下配置，模板见 [.env.example](../.env.example)。
+
+| 配置 | 本机开发 | 正式送测 |
+| --- | --- | --- |
+| AGENT_TRACE_DEEPSEEK_BASE_URL、AGENT_TRACE_DEEPSEEK_MODEL、AGENT_TRACE_DEEPSEEK_API_KEY | 官方 Base URL 为 https://api.deepseek.com，模型 ID 为 deepseek-flash，注入官方 Key | 填内网 DeepSeek 服务或兼容网关的地址、模型 ID 和鉴权信息 |
+| AGENT_TRACE_INTERNLM_BASE_URL、AGENT_TRACE_INTERNLM_MODEL、AGENT_TRACE_INTERNLM_API_KEY | 使用 A100 实际 9B 地址，或已建立 SSH 隧道的 http://127.0.0.1:本地端口/v1 | 填书生 9B 服务的地址、模型 ID 和鉴权信息 |
+
+Base URL 写接口前缀，例如 LMDeploy 使用 /v1。解析服务在此前缀下请求 /chat/completions。
+从实际运行后端的进程或容器请求同一前缀下的 /models，并用一条测试消息核对模型 ID、
+鉴权和 JSON 响应。在同一 Docker 网络的不同容器之间使用服务名，跨机器使用可达的内网地址。
+127.0.0.1 指后端自己的网络空间。现有 A100 启动脚本的 1221 对应 InternLM3-8B，
+1222 对应 Qwen，书生 9B 的实际版本、ID 和端口以交付服务的配置及探测结果为准。
+
+请在后端运行环境注入真实 Key。配置缺失、端点不可用或结论校验失败时，当前轨迹按规则结果
+展示和导出，整批回退原因记录在快照的 audit_completion 中。服务默认连接超时为 5 秒，
+单次读取等待为 45 秒，每个后端进程最多并发 2 次模型请求。重新解析时可以重新选择策略。
+
 ## 统计指标与 JSON 查看
 
 - GET `/compliance/agent-traces/statistics`：批次选择、八个指标、八个图表、完整性及列表上下文。
@@ -193,7 +222,7 @@ app/services/agent_trace_internal.py 提供服务器端 record_model_call：真�
 
 ## 后端规则审计（trace-rules-v1）
 
-解析发布新快照前执行规则；不调用任何大模型。已有 upload/internal_model 批次由后台升级到新快照，
+解析发布新快照前先执行规则，上传解析任务按所选策略调用模型补查。已有 upload/internal_model 批次由后台按规则升级到新快照，
 旧快照、已提交导出和历史统计不被覆盖。后台每轮升级一个批次，后续补算统计；页面若固定旧快照，
 点击“查看最新结果”。批次名称统一显示为“名称（系统编号）”。
 

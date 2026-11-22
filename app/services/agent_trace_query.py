@@ -179,7 +179,7 @@ def resolve(db, batch_id, params):
     llm_access(db, batch)
     sid = params.get("snapshot_id") or batch.active_snapshot_id
     snapshot = db.get(TraceSnapshot, sid)
-    if not snapshot:
+    if not snapshot or snapshot.payload.get("staging_task_id"):
         fail(410, "审计快照已过期或不存在")
     if snapshot.batch_id != batch_id:
         fail(409, "快照不属于当前批次")
@@ -216,6 +216,28 @@ def rule_audit_projection(payload):
     audit.update(result_state=state, finding_count=count, display_message=message)
     return {"rule_audit": audit,
             "rule_findings": redact(findings if isinstance(findings, list) else [], preserve_ids=True)}
+
+
+def tool_projection(sample, calls):
+    from app.services.agent_trace_audit import has_located_model_findings
+    from app.services.agent_trace_call_status import project_calls as project_statuses
+    from app.services.agent_trace_duplicates import project_calls as project_duplicates
+
+    if has_located_model_findings(sample.payload):
+        return calls, sample.payload["inefficiency_groups"]
+    record = sample.result.get("source_record")
+    return project_duplicates(project_statuses(calls, record), record)
+
+
+def tool_audit_projection(sample, calls, *, refresh_failures=False):
+    from app.services.agent_trace_audit import has_located_model_findings
+    from app.services.agent_trace_call_status import project_audit as project_failures
+    from app.services.agent_trace_duplicates import project_audit as project_duplicates
+
+    if has_located_model_findings(sample.payload):
+        return rule_audit_projection(sample.payload)
+    payload = project_duplicates(sample.payload, calls, sample.result.get("source_record"))
+    return rule_audit_projection(project_failures(payload, calls) if refresh_failures else payload)
 
 
 def sample_summary(row):
@@ -378,14 +400,8 @@ def tool_detail(db, batch, scope, trace, params, user):
     section = params.get("section", "overview")
     if section not in {"overview", "calls", "sequence", "selection"}:
         fail(422, "工具交互 section 无效")
-    calls = process_records(db, scope, trace, TraceCall)
-    from app.services.agent_trace_call_status import project_calls as project_statuses
-    calls = project_statuses(calls, sample.result.get("source_record"))
-    from app.services.agent_trace_duplicates import project_calls
-    calls, duplicate_groups = project_calls(calls, sample.result.get("source_record"))
-    from app.services.agent_trace_duplicates import project_audit as project_duplicate_audit
-    duplicate_payload = project_duplicate_audit(sample.payload, calls, sample.result.get("source_record"))
-    calls = redact(calls, preserve_ids=True)
+    projected_calls, duplicate_groups = tool_projection(sample, process_records(db, scope, trace, TraceCall))
+    calls = redact(projected_calls, preserve_ids=True)
     lookup = {c["call_id"]: c for c in calls}
     cid = params.get("call_id")
     if cid and cid not in lookup:
@@ -429,8 +445,7 @@ def tool_detail(db, batch, scope, trace, params, user):
     if section == "sequence":
         return {**common, "sequence": sequence}
     counts = {s: sum(c["execution_status"] == s for c in calls) for s in ("succeeded", "failed", "not_executed", "unknown")}
-    from app.services.agent_trace_call_status import project_audit
-    findings = rule_audit_projection(project_audit(duplicate_payload, calls))
+    findings = tool_audit_projection(sample, projected_calls, refresh_failures=True)
     if steps.plan(sample) is not None:
         display_events, event_mapping, _, _ = steps.project(sample, process_records(db, scope, trace, TraceEvent))
         findings = steps.remap_findings(findings, event_mapping, display_events)
@@ -666,11 +681,8 @@ def execution_detail(db, scope, trace, params, user):
              "next_cursor": cursor(scope, trace, graph_kind, end, user) if end < len(events) else None}
     if section == "graph":
         return {**common, "graph": graph}
-    from app.services.agent_trace_call_status import project_calls as project_statuses
-    from app.services.agent_trace_duplicates import project_audit as project_duplicate_audit
-    audit_payload = project_duplicate_audit(sample.payload,
-        project_statuses(process_records(db, scope, trace, TraceCall), sample.result.get("source_record")),
-        sample.result.get("source_record"))
+    calls, _ = tool_projection(sample, process_records(db, scope, trace, TraceCall))
+    audit = tool_audit_projection(sample, calls)
     patterns = [{"pattern_id": e["evidence_id"], "label": e["risk_type"]["label"], "event_id": e["event_id"],
         "event_display_id": next(x["display_id"] for x in events if x["event_id"] == e["event_id"]),
         "snippet": e["match_pattern"], "evidence_id": e["evidence_id"]} for e in evidence]
@@ -680,6 +692,5 @@ def execution_detail(db, scope, trace, params, user):
             "event_count": len({e["event_id"] for e in evidence if e["risk_type"]["code"] == code})} for code in sorted({e["risk_type"]["code"] for e in evidence})],
                               "availability": "partial" if evidence else "unavailable"},
         "danger_patterns": page(patterns, number(params, "pattern_page", 1, 2_147_483_647), 20),
-        **(steps.remap_findings(rule_audit_projection(audit_payload), event_mapping, events)
-           if step_counts["step_count"] is not None else rule_audit_projection(audit_payload)),
+        **(steps.remap_findings(audit, event_mapping, events) if step_counts["step_count"] is not None else audit),
         "permissions": permissions(user), "data_origin": sample.payload["data_origin"]}

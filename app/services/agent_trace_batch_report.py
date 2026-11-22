@@ -7,8 +7,7 @@ from sqlalchemy import select
 
 from app.models.agent_traces import TraceEvent, TraceEvidence
 from app.services import agent_trace_query as q
-from app.services.agent_trace_competition import MISSING, NAMES, text
-from app.services.agent_trace_duplicates import duplicate_groups
+from app.services.agent_trace_competition import MISSING, NAMES, first_risk, text
 
 VERSION = "batch-report-v1"
 
@@ -19,8 +18,7 @@ def tool_counts(calls):
 
 
 def ordinary_report(db, scope, sample, calls):
-    from app.services.agent_trace_call_status import project_calls
-    calls = project_calls(calls, sample.result.get("source_record"))
+    calls, groups = q.tool_projection(sample, calls)
     payload = sample.payload
     if payload.get("data_origin") != "actual":
         q.fail(422, "当前快照含模拟轨迹，不能生成真实原文报告")
@@ -86,6 +84,8 @@ def ordinary_report(db, scope, sample, calls):
                       "severity": item.get("severity"), "outcome": item.get("outcome", "recorded"),
                       "risk_quote": item.get("match_pattern", ""),
                       "evidence": original_evidence or [{**location(event), "quote": item.get("match_pattern", "")}]})
+    if any(item.get("detection_source") == "model_fallback" for item in evidence_rows):
+        risks = first_risk([{**risk, "step_id": risk.get("step_id", risk.get("event_ordinal"))} for risk in risks])
 
     rendered_calls, unmatched, missing, failures, repeats = [], [], [], [], []
     for call in calls:
@@ -110,17 +110,23 @@ def ordinary_report(db, scope, sample, calls):
     for call in calls:
         for failure in call.get("execution_failures", []):
             returned = by_id.get(call.get("return_event_id"))
-            failures.append({**location(by_id[call["event_id"]]), "error_type": failure["error_type"],
-                             "evidence": [{**location(returned), "quote": failure["quote"]}]})
+            finding = {**location(by_id[call["event_id"]]), "error_type": failure["error_type"],
+                       "evidence": [{**location(returned), "quote": failure["quote"]}]}
+            if failure.get("rule_id") == "other":
+                finding.update(rule_id="other", evidence=failure["source_evidence"])
+            failures.append(finding)
 
-    for group in duplicate_groups(calls, sample.result.get("source_record")):
+    for group in groups:
         for pair in group["pairs"]:
             call_id = pair["call_id"]
             previous = calls_by_id[pair["previous_call_id"]]
             call = calls_by_id[call_id]
-            repeats.append({**location(by_id[call["event_id"]]), "rule_id": "repeated_request",
-                            "issue": group["reason"], "previous_step_id": location(by_id[previous["event_id"]])["step_id"],
-                            "evidence": call_evidence(previous) + call_evidence(call) + pair["context_evidence"]})
+            source = pair["context_evidence"]
+            if pair.get("rule_id") != "other":
+                source = call_evidence(previous) + call_evidence(call) + source
+            repeats.append({**location(by_id[call["event_id"]]), "rule_id": pair.get("rule_id", "repeated_request"),
+                            "issue": pair.get("reason", group["reason"]),
+                            "previous_step_id": location(by_id[previous["event_id"]])["step_id"], "evidence": source})
 
     issues = payload.get("issue_types", [])
     missing.extend({"field": code, "issue": label, "evidence": []} for code, label in (

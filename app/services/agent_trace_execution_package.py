@@ -94,7 +94,12 @@ def risk_groups(db, scope, sample):
             entries.append(({}, evidence))
 
     groups = {}
+    trace_risks = []
     for order, (finding, evidence) in enumerate(entries):
+        if finding.get("scope") == "trace":
+            trace_risks.append({"step_id": None, "rule_id": finding["rule_id"], "scope": "trace",
+                                "risk_quote": "", "evidence": []})
+            continue
         event_id = evidence.get("event_id") or finding.get("event_id")
         step = positive(finding.get("competition_step")) or positive(evidence.get("competition_step"))
         step = step or event_steps.get(event_id)
@@ -124,8 +129,8 @@ def risk_groups(db, scope, sample):
                 group["seen"].add(identity)
                 group["evidence"].append({"step_id": evidence_step, "quote": value})
     ordered = sorted(groups.values(), key=lambda g: (g["step_id"] is None, g["step_id"] or 0))
-    return [{"step_id": g["step_id"], "risk_quote": "\n\n".join(g["quotes"]), "evidence": g["evidence"]}
-            for g in ordered]
+    return [{"step_id": group["step_id"], "risk_quote": "\n\n".join(group["quotes"]), "evidence": group["evidence"]}
+            for group in ordered] + trace_risks
 
 
 def build(db, task):
@@ -136,7 +141,8 @@ def build(db, task):
     for sample, report in zip(samples, submission[:-1], strict=True):
         risks = risk_groups(db, scope, sample)
         identity = report["trajectory_id"]
-        first.append({"trajectory_id": identity, "B3": {"指标": FIRST_METRIC, "risks": risks[:1]}})
+        located = [risk for risk in risks if risk.get("scope") != "trace"]
+        first.append({"trajectory_id": identity, "B3": {"指标": FIRST_METRIC, "risks": located[:1]}})
         all_risks.append({"trajectory_id": identity, "B3": {"指标": ALL_METRIC, "risks": risks}})
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:

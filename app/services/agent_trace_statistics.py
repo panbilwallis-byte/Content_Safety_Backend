@@ -4,9 +4,9 @@ from copy import deepcopy
 import hashlib
 import math
 
-from sqlalchemy import select, func
+from sqlalchemy import select, func, update
 
-from app.models.agent_traces import TraceBatch, TraceSample, TraceProjection, TraceStatisticsSample, TraceCall, TraceEvent
+from app.models.agent_traces import TraceBatch, TraceSnapshot, TraceSample, TraceProjection, TraceStatisticsSample, TraceCall, TraceEvent
 from app.services.agent_trace_generation import stable_id, dumps
 from app.services import agent_trace_query as q
 from app.services import agent_trace_steps
@@ -16,49 +16,59 @@ CATEGORIES = [("prompt_injection", "提示注入"), ("unauthorized_access", "越
               ("privacy_leak", "隐私泄露"), ("harmful_content", "有害内容"), ("tool_misuse", "工具滥用"), ("other", "其他"), ("normal", "正常任务")]
 
 
+def statistics_sample(sample):
+    p = sample.payload
+    generated = p.get("field_origins", {}).get("calls") == "generated" or p.get("data_origin") == "generated"
+    # Persist generated test labels separately; never treat a value score as risk evidence.
+    category = p.get("test_category")
+    if isinstance(category, dict):
+        category = category.get("code")
+    category = category or (CATEGORIES[int(sample.trace_id[-4:], 16) % 6][0] if generated else "unknown")
+    usage = p.get("token_usage") or {}
+    values = {"input": usage.get("input_tokens"), "reasoning_recorded": usage.get("reasoning_tokens"),
+              "final_output": usage.get("final_output_tokens", usage.get("output_tokens"))}
+    if usage.get("output_includes_reasoning") and values["final_output"] is not None:
+        values["final_output"] = (values["final_output"] - values["reasoning_recorded"]
+            if values["reasoning_recorded"] is not None and values["final_output"] >= values["reasoning_recorded"] else None)
+    for key, value in values.items():
+        if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 0):
+            values[key] = None
+    missing_fields = []
+    availability = {"source": "available" if p.get("source") else "not_provided",
+        "time": "available" if p.get("duration_ms") is not None else "not_provided",
+        "reasoning": "available" if values["reasoning_recorded"] is not None else "not_provided"}
+    missing_fields = [k for k, v in availability.items() if v != "available"]
+    complete = all(v is not None for v in values.values())
+    values.update(total_recorded=(sum(v for v in values.values() if isinstance(v, int)) if any(v is not None for v in values.values()) else None),
+        estimated=usage.get("estimated", False), normalization_policy="mutually_exclusive_v1", availability="available" if complete else "partial")
+    actual_decision = p.get("audit_decision", "unknown")
+    display_decision = actual_decision
+    if generated and actual_decision == "unknown":
+        display_decision = "risk_found" if p.get("scenario_code") != "tools_1" else "no_risk_found"
+    task_status = p.get("task_status") or ("failed" if sample.result.get("error_code") else "completed" if generated else "unknown")
+    return TraceStatisticsSample(id=stable_id("sts_", sample.snapshot_id, sample.trace_id), snapshot_id=sample.snapshot_id,
+        trace_id=sample.trace_id, payload={"test_category": category, "token_usage": values,
+            "missing_fields": missing_fields, "availability": availability, "task_status": task_status,
+            "audit_decision": display_decision, "actual_audit_decision": p.get("source_audit_decision", actual_decision),
+            "data_origin": "mixed" if generated else p.get("data_origin", "actual")})
+
+
 def materialize(db):
     """Background migration: add an independent display projection, not new source facts."""
     pending = (select(TraceSample).outerjoin(TraceStatisticsSample,
         (TraceStatisticsSample.snapshot_id == TraceSample.snapshot_id) & (TraceStatisticsSample.trace_id == TraceSample.trace_id))
-        .where(TraceStatisticsSample.id.is_(None)))
+        .join(TraceSnapshot, TraceSnapshot.snapshot_id == TraceSample.snapshot_id)
+        .where(TraceStatisticsSample.id.is_(None), TraceSnapshot.payload["staging_task_id"].as_string().is_(None)))
     first = db.scalar(pending.limit(1))
-    missing = list(db.scalars(pending.where(TraceSample.snapshot_id==first.snapshot_id).limit(500))) if first else []
+    if not first:
+        return 0
+    # Keep publication of derived statistics serialized with batch deletion.
+    if not db.execute(update(TraceSnapshot).where(TraceSnapshot.snapshot_id == first.snapshot_id)
+                      .values(payload=TraceSnapshot.payload).execution_options(synchronize_session=False)).rowcount:
+        return 0
+    missing = list(db.scalars(pending.where(TraceSample.snapshot_id==first.snapshot_id).limit(500)))
     snapshots = {r.snapshot_id for r in missing}
-    for sample in missing:
-        p = sample.payload
-        generated = p.get("field_origins", {}).get("calls") == "generated" or p.get("data_origin") == "generated"
-        # Persist generated test labels separately; never treat a value score as risk evidence.
-        category = p.get("test_category")
-        if isinstance(category, dict):
-            category = category.get("code")
-        category = category or (CATEGORIES[int(sample.trace_id[-4:], 16) % 6][0] if generated else "unknown")
-        usage = p.get("token_usage") or {}
-        values = {"input": usage.get("input_tokens"), "reasoning_recorded": usage.get("reasoning_tokens"),
-                  "final_output": usage.get("final_output_tokens", usage.get("output_tokens"))}
-        if usage.get("output_includes_reasoning") and values["final_output"] is not None:
-            values["final_output"] = (values["final_output"] - values["reasoning_recorded"]
-                if values["reasoning_recorded"] is not None and values["final_output"] >= values["reasoning_recorded"] else None)
-        for key, value in values.items():
-            if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 0):
-                values[key] = None
-        missing_fields = []
-        availability = {"source": "available" if p.get("source") else "not_provided",
-            "time": "available" if p.get("duration_ms") is not None else "not_provided",
-            "reasoning": "available" if values["reasoning_recorded"] is not None else "not_provided"}
-        missing_fields = [k for k, v in availability.items() if v != "available"]
-        complete = all(v is not None for v in values.values())
-        values.update(total_recorded=(sum(v for v in values.values() if isinstance(v, int)) if any(v is not None for v in values.values()) else None),
-            estimated=usage.get("estimated", False), normalization_policy="mutually_exclusive_v1", availability="available" if complete else "partial")
-        actual_decision = p.get("audit_decision", "unknown")
-        display_decision = actual_decision
-        if generated and actual_decision == "unknown":
-            display_decision = "risk_found" if p.get("scenario_code") != "tools_1" else "no_risk_found"
-        task_status = p.get("task_status") or ("failed" if sample.result.get("error_code") else "completed" if generated else "unknown")
-        db.add(TraceStatisticsSample(id=stable_id("sts_", sample.snapshot_id, sample.trace_id), snapshot_id=sample.snapshot_id,
-            trace_id=sample.trace_id, payload={"test_category": category, "token_usage": values,
-                "missing_fields": missing_fields, "availability": availability, "task_status": task_status,
-                "audit_decision": display_decision, "actual_audit_decision": p.get("source_audit_decision", actual_decision),
-                "data_origin": "mixed" if generated else p.get("data_origin", "actual")}))
+    db.add_all(statistics_sample(sample) for sample in missing)
     db.flush()
     for sid in snapshots:
         remaining=db.scalar(select(func.count()).select_from(pending.where(TraceSample.snapshot_id==sid).subquery()))
@@ -149,13 +159,11 @@ def aggregate(db, scope, params, user):
     n = len(data)
     calls = [{**r.payload,"_trace_id":r.trace_id} for r in db.scalars(select(TraceCall).where(TraceCall.snapshot_id == scope["snapshot_id"],
         TraceCall.trace_id.in_([s.trace_id for s, _ in data])).order_by(TraceCall.trace_id, TraceCall.ordinal))] if data else []
-    from app.services.agent_trace_duplicates import project_calls
-    from app.services.agent_trace_call_status import project_calls as project_statuses
     calls_by_trace = {}
     for call in calls:
         calls_by_trace.setdefault(call["_trace_id"], []).append(call)
-    calls = [call for sample, _ in data for call in project_calls(project_statuses(
-        calls_by_trace.get(sample.trace_id, []), sample.result.get("source_record")), sample.result.get("source_record"))[0]]
+    calls = [call for sample, _ in data
+             for call in q.tool_projection(sample, calls_by_trace.get(sample.trace_id, []))[0]]
     risk = len(filtered(data, "risk"))
     missing = len(filtered(data, "missing_fields"))
     def metric(value, unit="count", valid=None):
@@ -278,8 +286,6 @@ def workspace(db, params, user):
 
 
 def normalized(db,scope,sample):
-    from app.services.agent_trace_call_status import project_calls
-    from app.services.agent_trace_duplicates import project_calls as project_duplicates
     raw_events = q.process_records(db,scope,sample.trace_id,TraceEvent)
     events, mapping, uncounted, counts = agent_trace_steps.project(sample, raw_events, sanitize=q.redact,
         reasoning_getter=q.original_reasoning, source_text_getter=q.recorded_event_text)
@@ -287,9 +293,8 @@ def normalized(db,scope,sample):
             "value_result":sample.result,"data_origin":sample.payload.get("data_origin"),
             "events":raw_events,"steps":events, **counts,
             "event_step_mapping":[{"source_event_id":source,"event_id":target} for source,target in mapping.items()],
-            "uncounted_source_events":uncounted,"calls":project_duplicates(project_calls(
-                q.process_records(db,scope,sample.trace_id,TraceCall),sample.result.get("source_record")),
-                sample.result.get("source_record"))[0]}
+            "uncounted_source_events":uncounted,
+            "calls":q.tool_projection(sample, q.process_records(db, scope, sample.trace_id, TraceCall))[0]}
 
 
 def detail(db,scope,trace,params,user):

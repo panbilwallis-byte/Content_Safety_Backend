@@ -105,6 +105,11 @@ def validate_input(db, data, user, *, execution_package=False):
 
 def create_task(db, data, user, key, name=None):
     from app.services.agent_trace_execution_package import requested, VERSION as PACKAGE_VERSION
+    from app.services.agent_trace_ingest import lock_batch
+
+    batch_id = data.get("batch_id")
+    if isinstance(batch_id, str) and lock_batch(db, batch_id) is None:
+        fail(404, "批次不存在")
     execution_package = requested(data)
     frozen = validate_input(db, data, user, execution_package=execution_package)  # Recheck on replay.
     identity = idem_key(user["uid"], "/tasks/execute", key)
@@ -189,11 +194,8 @@ def build_artifact(db, task):
     batch, scope = resolve(db, data["batch_id"], data)
     trace = data["selected_trace_id"]
     sample = get_sample(db, scope, trace)
-    from app.services.agent_trace_duplicates import project_calls as project_duplicates, project_audit as project_duplicate_audit
-    from app.services.agent_trace_call_status import project_calls as project_statuses
-    calls, _ = project_duplicates(project_statuses(process_records(db, scope, trace, TraceCall),
-        sample.result.get("source_record")), sample.result.get("source_record"))
-    audit = query.rule_audit_projection(project_duplicate_audit(sample.payload, calls, sample.result.get("source_record")))
+    calls, _ = query.tool_projection(sample, process_records(db, scope, trace, TraceCall))
+    audit = query.tool_audit_projection(sample, calls)
     document = {"scope": scope, "sample": {**query.sample_summary(sample), "source": sample.payload["source"]},
         "value_result": sample.result, "events": process_records(db, scope, trace, TraceEvent),
         "calls": calls, **audit,

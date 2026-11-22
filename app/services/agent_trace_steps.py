@@ -279,12 +279,15 @@ def project(sample, raw_events, sanitize=lambda value: value, reasoning_getter=N
 
 
 def remap_findings(projection, mapping, events):
-    """Only clickable action findings belong in the step graph projection."""
+    """Keep trajectory judgments and locate findings linked to action steps."""
     value = deepcopy(projection)
     by_id = {e["event_id"]: e for e in events}
     original_only = []
     findings = []
     for finding in value.get("rule_findings", []):
+        if finding.get("scope") == "trace":
+            findings.append(finding)
+            continue
         eid = mapping.get(finding.get("event_id"))
         if eid not in by_id:
             original_only.append(finding)

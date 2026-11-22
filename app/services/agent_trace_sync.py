@@ -114,6 +114,7 @@ class TraceSynchronizer:
         self.sessions = sessions
         self.stop_event = threading.Event()
         self.thread = None
+        self.deadline_thread = None
         url = os.getenv("AGENT_TRACE_LLM_DATABASE_URL")
         self.external = create_engine(url, pool_pre_ping=True, echo=False) if url else None
 
@@ -208,10 +209,12 @@ class TraceSynchronizer:
                 db.commit()
             if not count:
                 break
+        from app.services.agent_trace_batch_audit import discard_finished_staging
         from app.services.agent_trace_export import run_export, directory
         from app.services.agent_trace_ingest import run as run_ingest
         from app.models.agent_traces import TraceArtifact
         with self.sessions() as db:
+            discard_finished_staging(db)
             pending = list(db.execute(select(Task.task_id, Task.capability_code).where(Task.capability_code.in_(["agent_trace_export", "agent_trace_ingest"]), Task.status == "pending")))
             # A crash during file generation must not leave an indefinitely running task.
             for task in db.scalars(select(Task).where(Task.capability_code == "agent_trace_export",
@@ -237,13 +240,27 @@ class TraceSynchronizer:
                 log.warning("Agent trace synchronization temporarily unavailable")
             self.stop_event.wait(10)
 
+    def watch_deadlines(self):
+        from app.services.agent_trace_batch_audit import publish_due
+
+        while not self.stop_event.is_set():
+            try:
+                publish_due(self.sessions)
+            except Exception:
+                log.warning("Trajectory audit deadline check temporarily unavailable")
+            self.stop_event.wait(10)
+
     def start(self):
         self.thread = threading.Thread(target=self.run, name="agent-trace-sync", daemon=True)
+        self.deadline_thread = threading.Thread(target=self.watch_deadlines, name="agent-trace-deadline", daemon=True)
+        self.deadline_thread.start()
         self.thread.start()
 
     def close(self):
         self.stop_event.set()
         if self.thread:
             self.thread.join(timeout=5)
+        if self.deadline_thread:
+            self.deadline_thread.join(timeout=5)
         if self.external:
             self.external.dispose()
