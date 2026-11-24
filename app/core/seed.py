@@ -892,7 +892,9 @@ def seed_initial_data():
             )
 
             if exists is None:
-                db.add(SystemUser(**item))
+                from app.core.auth import hash_password
+
+                db.add(SystemUser(**item, password_hash=hash_password(DEMO_PASSWORDS[item["username"]])))
                 # 初始化系统角色及权限。
         # role_code 唯一，重复启动服务时不会重复插入。
         role_seeds = [
