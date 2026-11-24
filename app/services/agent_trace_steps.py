@@ -9,6 +9,7 @@ import re
 
 from app.services.agent_trace_competition import parse
 from app.services.agent_trace_generation import dumps, stable_id
+from app.services import agent_trace_anthropic as anthropic
 
 VERSION = "action-steps-v1"
 
@@ -183,7 +184,15 @@ def plan(sample):
     if not isinstance(record, dict) or sample.payload.get("data_origin") == "generated":
         return None
     try:
-        if isinstance(record.get("messages"), list):
+        if sample.payload.get("source", {}).get("format_code") == anthropic.CODE:
+            adapted, paths = anthropic.message_view(record)
+            steps = messages_steps(adapted)
+            for step in steps:
+                step["anchor"] = paths[step["anchor"]]
+                step["paths"] = [paths[path] for path in step["paths"] if path in paths]
+                for part in step["parts"]:
+                    part["source_path"] = paths[part["source_path"]]
+        elif isinstance(record.get("messages"), list):
             steps = messages_steps(record)
         elif isinstance(record.get("runs"), list):
             steps = langchain_steps(record)

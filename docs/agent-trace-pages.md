@@ -59,13 +59,12 @@ LangChain 按根运行拆分，缺父节点或循环引用拒绝；工具调用�
 ### 模型补查与联调
 
 在上传解析任务的 input 中填写可选的 audit_strategy。省略或填 default 时仅运行平台规则。
-选择 deepseek-4.1-flash 时用 DeepSeek 补查，选择 internlm-9b 时用书生补查。每条轨迹先运行规则，
-规则先审计整批并分段持久化，暂存快照不可查询或导出。模型随后读取完整的规则结果，
-返回 JSON 结论、步骤号、片段编号及逐字引文。原文核验通过的风险标为 other。
-整批补查完成才发布合并快照；模型不可用或补查未完成时发布规则快照。
+选择 deepseek-4.1-flash 时用 DeepSeek 补查，选择 internlm-9b 时用书生补查。规则先审计整批并分段持久化，
+模型随后逐条审查已成功解析的轨迹。每条模型结果独立保存，一条失败时继续补查后续轨迹。
+明确的有风险结论标为 other。步骤、片段和引文通过原文核验后提供定位，否则保存轨迹级结论。
 自任务受理开始计时，22 小时 55 分钟停止等待审计，预留 5 分钟发布。独立检查器可以在
-模型请求仍等待时发布规则快照；规则阶段到点则发布已持久化的部分。
-页面在发布前继续读取既有快照，截止原因和实际完成数量留在后台快照元数据。
+模型请求仍等待时发布已保存的规则和模型结论。规则阶段到点时发布已持久化的部分。
+暂存快照在发布前不可查询或导出。发布原因和补查完成、失败及未开始的数量记录在任务结果和快照的 audit_completion 中。
 工具失败及重复调用仍由平台规则判定。
 
 后端通过 .env 或容器运行时环境变量接收以下配置，模板见 [.env.example](../.env.example)。
@@ -81,8 +80,8 @@ Base URL 写接口前缀，例如 LMDeploy 使用 /v1。解析服务在此前缀
 127.0.0.1 指后端自己的网络空间。现有 A100 启动脚本的 1221 对应 InternLM3-8B，
 1222 对应 Qwen，书生 9B 的实际版本、ID 和端口以交付服务的配置及探测结果为准。
 
-请在后端运行环境注入真实 Key。配置缺失、端点不可用或结论校验失败时，当前轨迹按规则结果
-展示和导出，整批回退原因记录在快照的 audit_completion 中。服务默认连接超时为 5 秒，
+请在后端运行环境注入真实 Key。端点不可用或模型未给出明确结论时，当前轨迹采用规则结果，
+模型失败原因记录在该轨迹的 model_audit 中。配置缺失时在批次的 audit_completion 中记录原因。服务默认连接超时为 5 秒，
 单次读取等待为 45 秒，每个后端进程最多并发 2 次模型请求。重新解析时可以重新选择策略。
 
 ## 统计指标与 JSON 查看
@@ -189,16 +188,23 @@ workspace 使用 `view=execution&include=options` 或 include=dashboard；列表
 涵盖默认隐藏旧模拟来源、实际文件导入、字段保留、非首屏定位、重解析、审计证据和导出。
 使用项目 .venv 的 pytest；测试数据库为内存 SQLite，不修改业务数据库。
 
+## Anthropic Messages
+
+支持 Claude Messages 轨迹。JSON 可包含单条轨迹或轨迹列表，JSONL 每行一条。
+同一文件可混合 OpenAI 和 Anthropic 记录，自动识别按记录判断格式。Anthropic 轨迹使用
+messages 内容块中的 tool_use 和 tool_result，并按 tool_use_id 配对，保留原始位置和工具错误。
+Token 取轨迹的 usage、token_totals 或 api_turns 中各轮的 response.usage。成功解析的轨迹
+进入规则审计，并按所选策略进入模型补查。
+
 ## 智能体轨迹 JSONL
 
-第三种格式现为 `agent_trajectory`，替换 Anthropic Messages；可自动识别或手动指定。
+`agent_trajectory` 可自动识别或手动指定。
 对应外部生成的 trajectories(2).jsonl：每行一个含 sample_id、events、tool_events、tokens 的样本。
 事件按 idx 排序，step_id 为分组编号，不能作为唯一事件编号。工具明细按 step_id + tool 关联，
 不会将 events 与 tool_events 重复计为两次调用。保留推理原文、相对时间、原始模型与样本编号、
 Token 估算标记及来源声明；success/error/blocked 分别映射为成功/失败/未执行。
 拦截耗时单独保留，不计入工具实际执行耗时。topic 仅为测试类别，不生成风险审计结论。
 outcome=success 映射为流程完成，不代表回答正确。Token 的 input/reasoning/output 按该采集格式的独立分量汇总。
-已有 Anthropic 历史数据不迁移，新文件不再提供该格式入口。重启后端并刷新前端后生效。
 
 ## 外部风险结果协议（可选）
 

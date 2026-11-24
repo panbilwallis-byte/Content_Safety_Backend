@@ -116,6 +116,11 @@ def reasoning_char_count(sample):
     # Ordinary/older imports may have original messages but no scoring report.
     record = sample.result.get("source_record") or {}
     messages = record.get("messages")
+    from app.services.agent_trace_anthropic import CODE as ANTHROPIC
+    if sample.payload.get("source", {}).get("format_code") == ANTHROPIC:
+        return sum(len(block["thinking"]) for message in messages if isinstance(message.get("content"), list)
+                   for block in message["content"] if block.get("type") == "thinking"
+                   and isinstance(block.get("thinking"), str))
     if isinstance(messages, list):
         return sum(len(body) for m in messages if isinstance(m, dict)
                    for body in [m.get("reasoning_content") or m.get("reasoning")]

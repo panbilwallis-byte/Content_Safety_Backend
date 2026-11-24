@@ -176,6 +176,9 @@ def outcome(output, *, metadata=None, error=False, command="", instructions="", 
 def project_calls(calls, record=None):
     """Reconcile actual recorded calls, including old success/failure classifications."""
     record = record or {}
+    from app.services import agent_trace_anthropic as anthropic
+    if anthropic.is_anthropic(record):
+        record, _ = anthropic.message_view(record)
     instructions = task_instructions(record)
     source_calls = []
     if isinstance(record.get("messages"), list):

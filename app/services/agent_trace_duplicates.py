@@ -97,6 +97,10 @@ def contexts(calls, record):
     """Attach source coordinates by original call order, never guessed IDs."""
     if not isinstance(record, dict):
         return [{} for _ in calls]
+    from app.services import agent_trace_anthropic as anthropic
+    paths = None
+    if anthropic.is_anthropic(record):
+        record, paths = anthropic.message_view(record)
     source = []
     messages = record.get("messages")
     if isinstance(messages, list):
@@ -118,6 +122,9 @@ def contexts(calls, record):
             user_index = next((j for j in range(i, -1, -1) if messages[j].get("role") == "user"), None)
             if user_index is not None and user_index < start and isinstance(messages[user_index].get("content"), str):
                 purpose.append({"message_index": user_index, "quote": messages[user_index]["content"]})
+            if paths is not None:
+                purpose = [{"source_path": paths[f"messages[{item['message_index']}]"], "quote": item["quote"]}
+                           for item in purpose]
             source.append({**call, "purpose": purpose})
     elif isinstance(record.get("runs"), list):
         for i, run in enumerate(record["runs"]):

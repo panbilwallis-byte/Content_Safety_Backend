@@ -66,7 +66,7 @@ def apply_model_audit(payload, trace, metadata, events, evidence):
     ordinal = metadata.get("risk_event_ordinal")
     event = next((item for item in events if item["ordinal"] == ordinal), None)
     quote, source = metadata.get("risk_quote"), metadata.get("source_evidence")
-    if not metadata.get("risk_detected") or event is None or not quote or not source:
+    if not metadata.get("risk_detected"):
         return
 
     risk_type = {"code": "other", "label": "其他风险"}
@@ -89,6 +89,8 @@ def apply_model_audit(payload, trace, metadata, events, evidence):
     report = payload.get("competition_report")
     if report:
         report["results"]["B2"]["judgment"] = "有风险"
+    if event is None or not quote or not source:
+        return
     from app.services.agent_trace_competition import first_risk
 
     ref = event.get("source_ref") or {}

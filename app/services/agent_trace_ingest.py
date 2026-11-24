@@ -18,6 +18,7 @@ from app.models.agent_traces import (TraceAsset, TraceBinding, TraceBatch, Trace
     TraceSample, TraceEvent, TraceCall, TraceRelation, TraceEvidence, TraceIdempotency, TraceStatisticsSample, TraceArtifact)
 from app.services.agent_trace_generation import VERSION, stable_id, generated_sample, validate_process, dumps
 from app.services import agent_trace_query as q
+from app.services import agent_trace_anthropic as anthropic
 
 from app.services.agent_trace_trajectory import EXAMPLE as TRAJECTORY_EXAMPLE, normalize_trajectory
 
@@ -25,6 +26,9 @@ MAX_BYTES = 10 * 1024 * 1024
 FORMATS = [
     {"code":"openai_messages","label":"OpenAI Messages","containers":["json","jsonl"],"description":"完整 messages 轨迹，支持工具调用和返回", "availability":"available","schema_version":"1",
      "example_text":dumps({"messages":[{"role":"user","content":"Summarize a public report"},{"role":"assistant","tool_calls":[{"id":"call_1","function":{"name":"search","arguments":'{"q":"public report"}'}}]},{"role":"tool","tool_call_id":"call_1","content":"Public result"}]})},
+    {"code":anthropic.CODE,"label":anthropic.LABEL,"containers":["json","jsonl"],
+     "description":"Claude Messages 轨迹，支持工具调用、工具返回和 Token", "availability":"available","schema_version":"1",
+     "example_text":dumps(anthropic.EXAMPLE)},
     {"code":"langchain_trace","label":"LangChain / LangSmith Trace","containers":["json","jsonl"],"description":"平台 runs 包装，按根运行分组", "availability":"available","schema_version":"1",
      "example_text":dumps({"runs":[{"id":"root","parent_run_id":None,"run_type":"chain","inputs":{"q":"report"},"outputs":{"answer":"summary"}},{"id":"tool","parent_run_id":"root","run_type":"tool","name":"search","inputs":{"q":"report"},"outputs":{"text":"result"}}]})},
     {"code":"agent_trajectory","label":"智能体轨迹 JSONL","containers":["json","jsonl"],"description":"外部智能体 events / tool_events 轨迹（含推理、工具及 Token）", "availability":"available","schema_version":"1",
@@ -380,16 +384,19 @@ def normalize(record,file_id,index,raw,line,override):
         if override not in {"auto","agent_trajectory"}:raise ValueError("格式覆盖与核心结构不一致")
         return normalize_trajectory(record,file_id,index,raw,line,normalize)
     if override=="agent_trajectory":raise ValueError("智能体轨迹缺少 sample_id 或 events")
+    source_record = record
     messages=record.get("messages")
     detected="langchain_trace" if isinstance(record.get("runs"),list) else None
     if isinstance(messages,list):
-        blocks=[b for m in messages if isinstance(m,dict) for b in (m.get("content") if isinstance(m.get("content"),list) else []) if isinstance(b,dict)]
-        if any(b.get("type") in {"tool_use","tool_result"} for b in blocks):raise ValueError("不再支持 Anthropic 格式，请选择支持的轨迹格式")
-        detected="openai_messages"
+        detected = (anthropic.CODE if override == anthropic.CODE or anthropic.is_anthropic(record)
+                    else "openai_messages")
     fmt=detected if override=="auto" else override
     if not fmt or (fmt=="langchain_trace" and not isinstance(record.get("runs"),list)) or (fmt!="langchain_trace" and not isinstance(messages,list)):
         raise ValueError("无法识别或格式覆盖与记录结构不匹配")
     if override!="auto" and detected!=fmt:raise ValueError("格式覆盖与核心结构不一致")
+    if fmt == anthropic.CODE:
+        record, source_paths = anthropic.message_view(record)
+        messages = record["messages"]
     trace=stable_id("trc_",file_id,index)
     competition = None
     if fmt == "openai_messages" and "trajectory_id" in record:
@@ -505,11 +512,20 @@ def normalize(record,file_id,index,raw,line,override):
                 call_index = int(path.split(".tool_calls[")[1].split("]")[0])
                 ids = [c["step_id"] for c in scoring_calls if c["message_index"] == message_index and c["call_index"] == call_index]
             e["source_step_ids"] = ids
+    if fmt == anthropic.CODE:
+        identity = source_record.get("trajectory_id", source_record.get("sample_id", source_record.get("id")))
+        if identity is not None and (not isinstance(identity, str) or not identity or len(identity) > 255):
+            raise ValueError("Anthropic 轨迹标识必须为1至255字符")
+        execution.update(original_sample_id=identity, origin_type="external_import",
+                         provider="anthropic", model=source_record.get("model"))
+        for e in events:
+            ref = e["source_ref"]
+            ref["source_path"] = source_paths[ref["source_path"]]
     language=record.get("language",metadata.get("language","unknown"))
     language=language if language in {"zh","en","other","unknown"} else "other"
     from app.services.agent_trace_audit import recorded_audit
-    recorded_audit(record, execution, events, calls)
-    return {"id":f"{file_id}:{index}","text":raw,"language":language,"execution":execution,"source_record":record}
+    recorded_audit(source_record, execution, events, calls)
+    return {"id":f"{file_id}:{index}","text":raw,"language":language,"execution":execution,"source_record":source_record}
 
 
 def split_roots(record):
@@ -649,7 +665,8 @@ def activate_snapshot(db, batch, snapshot):
 
     sid = snapshot.snapshot_id
     snapshot.payload = {k: v for k, v in snapshot.payload.items()
-                        if k not in {"staging_task_id", "next_order", "file_updates", "parsed_count", "rules_complete"}}
+                        if k not in {"staging_task_id", "next_order", "file_updates", "parsed_count", "rules_complete",
+                                     "model_completed_trace_count", "model_unavailable_trace_count"}}
     for version in (VERSION, STATS_VERSION):
         db.add(TraceProjection(projection_id=stable_id("proj_", sid, version), snapshot_id=sid,
                                version=version, payload={"policy_version": version, "data_origin": "actual"}))
@@ -685,7 +702,7 @@ def store_prepared(db, sid, sample, order, projection, *, stage=False):
 
 def parse_asset(file_id, filename, path, digest, override):
     errors, success = [], []
-    detected, candidate = None, 0
+    formats, candidate = set(), 0
     try:
         raw_bytes = Path(path).read_bytes()
         if len(raw_bytes) > MAX_BYTES or hashlib.sha256(raw_bytes).hexdigest() != digest:
@@ -701,13 +718,14 @@ def parse_asset(file_id, filename, path, digest, override):
                     value = normalize(root, file_id, len(success), raw, line, override)
                     value["execution"]["source"]["filename"] = filename
                     success.append(value)
-                    detected = value["execution"]["source"]["format_code"]
+                    formats.add(value["execution"]["source"]["format_code"])
             except (ValueError, KeyError, TypeError, AttributeError):
                 errors.append({"record_index": candidate, "line_start": line, "source_path": "$",
                                "code": "invalid_record", "message": "记录结构或调用参数无效"})
     except (OSError, ValueError, UnicodeError):
         errors.append({"record_index": 1, "line_start": 1, "source_path": "$",
                        "code": "invalid_file", "message": "文件格式、编码或完整性无效"})
+    detected = "mixed" if len(formats) > 1 else next(iter(formats), None)
     return success, {
         "detected_format": detected, "recognition_state": "recognized" if detected else "unknown",
         "parse_status": ("partial" if success else "failed") if errors else "succeeded",
@@ -788,7 +806,7 @@ def workspace(db,params,user):
     output={"resolved_selection":{"batch_id":bid,"snapshot_id":None,"source_id":None,"trace_id":None},"formats":FORMATS,
         "upload_policy":{"allowed_extensions":[".json",".jsonl"],"max_file_bytes":MAX_BYTES,"max_files_per_request":20},
         "source_options":q.page([],1,50),"batch_options":options,"batch":batch_dict(batch,user) if batch else None,"files":q.page([],1,20),
-        "summary":{"file_count":0,"supported_format_count":3,"imported_format_count":0,"parsed_trace_count":0,"failed_record_count":0,"category_mode":"single","by_language":[],"by_category":[],"by_format":[]},
+        "summary":{"file_count":0,"supported_format_count":len(FORMATS),"imported_format_count":0,"parsed_trace_count":0,"failed_record_count":0,"category_mode":"single","by_language":[],"by_category":[],"by_format":[]},
         "validation":{"trace_total":0,"metrics":[{"code":c,"passed":0,"eligible":0,"missing":0,"failed":0,"not_applicable":0,"state":"not_applicable"} for c in ("structure","call_link","time","usage")],"can_continue":False,"blockers":["尚无有效轨迹"]},
         "issues":[],"sample_page":q.page([],1,20),"active_tasks":[],"export_options":{"scopes":["batch","filtered","sample"],"anonymize_required":True,
             "contents":[{"code":c,"availability":"available"} for c in ("normalized_json","offline_html","evidence_index","manifest","error_report")]}}
@@ -832,7 +850,7 @@ def workspace(db,params,user):
     output["resolved_selection"]={"batch_id":bid,"snapshot_id":sid,"source_id":source or (chosen.payload["source"]["source_id"] if chosen else None),"trace_id":chosen.trace_id if chosen else None}
     formats=Counter(r.payload["source"].get("format_code","value_analysis") for r in all_rows)
     cats=Counter(sample_item(r)["test_category"] for r in all_rows)
-    output["summary"]={"file_count":len(sources),"supported_format_count":3,"imported_format_count":len(formats),"parsed_trace_count":len(all_rows),"failed_record_count":sum(f["failed_record_count"] for f in file_rows),
+    output["summary"]={"file_count":len(sources),"supported_format_count":len(FORMATS),"imported_format_count":len(formats),"parsed_trace_count":len(all_rows),"failed_record_count":sum(f["failed_record_count"] for f in file_rows),
         "category_mode":"single","by_language":[{"code":l,"count":n} for l,n in Counter(r.language for r in all_rows).items()],
         "by_category":[{"code":c,"label":c,"count":n} for c,n in cats.items()],"by_format":[{"code":c,"trace_count":n} for c,n in formats.items()]}
     metrics=[]

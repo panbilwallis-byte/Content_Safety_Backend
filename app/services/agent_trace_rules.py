@@ -6,6 +6,7 @@ import re
 
 from app.services.agent_trace_generation import stable_id
 from app.services.agent_trace_attack_rules import ATTACK_RULES, attack_findings
+from app.services import agent_trace_anthropic as anthropic
 
 VERSION = "trace-rules-v3"
 SECURITY_RULES = {
@@ -60,7 +61,8 @@ def audit_process(payload, events, calls, source_evidence=(), record=None):
     evidence = deepcopy(list(source_evidence))
     report = None
     coordinates = {}
-    if isinstance(record, dict) and isinstance(record.get("messages"), list):
+    native = payload.get("source", {}).get("format_code") == anthropic.CODE
+    if not native and isinstance(record, dict) and isinstance(record.get("messages"), list):
         from app.services.agent_trace_competition import analyze, parse
         from app.services.agent_trace_security import security_findings
         # Finalize unified risk decisions before choosing reviewed excerpts.
@@ -129,13 +131,47 @@ def audit_process(payload, events, calls, source_evidence=(), record=None):
             if event_id:
                 add(risk["rule_id"], "security", risk["label"], event_id, risk["risk_quote"],
                     calls_by_event.get(event_id), risk["severity"], risk["outcome"], risk["evidence"])
+    elif native:
+        from app.services.agent_trace_competition import parse
+        from app.services.agent_trace_security import security_findings
+
+        adapted, paths = anthropic.message_view(record)
+        scoring_calls, _, _, _, _, locations = parse(adapted)
+        by_path = {event["source_ref"]["source_path"]: event for event in events}
+        calls_by_event = {call["event_id"]: call for call in calls}
+        for index, steps in locations.items():
+            if len(steps) != 1:
+                continue
+            prefix = f"messages[{index}]"
+            for key in (prefix, prefix + ".content", prefix + ".reasoning_content"):
+                event = by_path.get(paths.get(key))
+                if event is not None:
+                    coordinates[event["event_id"]] = {"competition_step": steps[0]}
+                    event["source_ref"].update(coordinates[event["event_id"]])
+        for source in scoring_calls:
+            key = f"messages[{source['message_index']}].tool_calls[{source['call_index']}]"
+            event = by_path[paths[key]]
+            call = calls_by_event[event["event_id"]]
+            coordinates[event["event_id"]] = {"competition_step": source["step_id"]}
+            event["source_ref"].update(coordinates[event["event_id"]])
+            call.update(coordinates[event["event_id"]])
+        for risk in security_findings(adapted["messages"], scoring_calls):
+            key = f"messages[{risk['message_index']}].tool_calls[{risk['call_index']}]"
+            event = by_path[paths[key]]
+            evidence_parts = []
+            for item in risk["evidence"]:
+                source_key = f"messages[{item['message_index']}]"
+                source_path = paths[key] if item["message_index"] == risk["message_index"] else paths[source_key]
+                evidence_parts.append({"source_path": source_path, "quote": item["quote"]})
+            add(risk["rule_id"], "security", risk["label"], event["event_id"], risk["risk_quote"],
+                calls_by_event[event["event_id"]], risk["severity"], risk["outcome"], evidence_parts)
 
     unknown_permission = 0
     for call in calls:
         event_id = call["event_id"]
         # Messages-format calls already use the shared detector above. Other
         # supported formats must receive the same six attack indicators too.
-        if report is None:
+        if report is None and not native:
             for risk in attack_findings(call.get("tool_name"), call.get("input_json")):
                 add(risk["rule_id"], "security", risk["label"], event_id,
                     call.get("input_json", ""), call, "high", "unknown")

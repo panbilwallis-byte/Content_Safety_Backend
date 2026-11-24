@@ -225,6 +225,7 @@ def report_rows(db, scope, user):
     from sqlalchemy import select
     from app.models.agent_traces import TraceSample, TraceCall
     from app.services.agent_trace_audit import has_located_model_findings
+    from app.services.agent_trace_anthropic import CODE as ANTHROPIC
     from app.services.agent_trace_batch_report import ordinary_report, tool_counts
     from app.services import agent_trace_query as q
     if not q.permissions(user)["can_view_raw"]:
@@ -235,9 +236,13 @@ def report_rows(db, scope, user):
         q.fail(422, "当前快照没有可导出的轨迹样本")
     rows, counts, ids = [], Counter(), set()
     reserved = {"aggregate"}
+    def scored_messages(sample, record):
+        return (sample.payload.get("source", {}).get("format_code") != ANTHROPIC
+                and record.get("trajectory_id") and isinstance(record.get("messages"), list))
+
     for sample in samples:
         record = sample.result.get("source_record", {})
-        if record.get("trajectory_id") and isinstance(record.get("messages"), list):
+        if scored_messages(sample, record):
             if record["trajectory_id"] in reserved:
                 q.fail(409, "当前快照包含重复或保留 trajectory_id，无法生成唯一报告")
             reserved.add(record["trajectory_id"])
@@ -246,7 +251,7 @@ def report_rows(db, scope, user):
     for sample in samples:
         record = sample.result.get("source_record", {})
         calls = q.process_records(db, scope, sample.trace_id, TraceCall)
-        if record.get("trajectory_id") and isinstance(record.get("messages"), list):
+        if scored_messages(sample, record):
             row = deepcopy(sample.payload.get("competition_report"))
             if not row:
                 q.fail(409, "当前快照缺少赛题分析结果，请等待规则升级或重新解析")

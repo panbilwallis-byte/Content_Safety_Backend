@@ -6,6 +6,7 @@ import re
 from sqlalchemy import select
 
 from app.models.agent_traces import TraceEvent, TraceEvidence
+from app.services.agent_trace_anthropic import CODE as ANTHROPIC
 from app.services import agent_trace_query as q
 from app.services.agent_trace_competition import MISSING, NAMES, first_risk, text
 
@@ -20,6 +21,7 @@ def tool_counts(calls):
 def ordinary_report(db, scope, sample, calls):
     calls, groups = q.tool_projection(sample, calls)
     payload = sample.payload
+    native = payload.get("source", {}).get("format_code") == ANTHROPIC
     if payload.get("data_origin") != "actual":
         q.fail(422, "当前快照含模拟轨迹，不能生成真实原文报告")
     events = q.process_records(db, scope, sample.trace_id, TraceEvent)
@@ -38,9 +40,13 @@ def ordinary_report(db, scope, sample, calls):
             result["message_index"] = message_index
         call = call_by_event.get(event["event_id"])
         if call:
-            result["step_id"] = by_id[call["event_id"]]["ordinal"]
+            request = by_id[call["event_id"]]
+            step = request["source_ref"].get("competition_step") if native else None
+            result["step_id"] = step if step is not None else request["ordinal"]
             result["call_id"] = call["call_id"]
         else:
+            if native and ref.get("competition_step") is not None:
+                result["step_id"] = ref["competition_step"]
             result["field"] = ref.get("source_path") or f"events[{event['ordinal'] - 1}]"
         return result
 

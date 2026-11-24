@@ -1,5 +1,4 @@
-"""Checkpoint rule and model snapshots before selecting a result to publish."""
-from contextlib import nullcontext
+"""Checkpoint rule results, then enrich the staged snapshot before publishing."""
 from datetime import timedelta
 import logging
 
@@ -27,9 +26,8 @@ class AuditStopped(Exception):
     """The task lost its publication window or another worker finalized it."""
 
 
-def snapshot_ids(task):
-    bid = task.input_data["batch_id"]
-    return stable_id("snap_", bid, task.task_id), stable_id("snap_", bid, task.task_id + ":model")
+def snapshot_id(task):
+    return stable_id("snap_", task.input_data["batch_id"], task.task_id)
 
 
 def running_task(db, task_id):
@@ -46,15 +44,14 @@ def work_task(db, task_id):
     return task
 
 
-def make_stage(db, task, *, model=False):
+def make_stage(db, task):
     data = task.input_data
     batch = db.get(TraceBatch, data["batch_id"])
     if not batch or batch.payload["batch_version"] != data["expected_version"]:
         raise ValueError("解析输入版本已变化")
-    suffix = ":model" if model else ""
-    sid = snapshot_ids(task)[int(model)]
+    sid = snapshot_id(task)
     if db.get(TraceSnapshot, sid) is None:
-        ingest.publish(db, batch, task.task_id + suffix, [], set(data["file_ids"]),
+        ingest.publish(db, batch, task.task_id, [], set(data["file_ids"]),
                        staging_task_id=task.task_id)
     return db.get(TraceSnapshot, sid)
 
@@ -68,7 +65,7 @@ def owned_files(db, task, batch):
     return files
 
 
-def finish(sessions, task_id, reason, *, model_complete=False):
+def finish(sessions, task_id, reason):
     with sessions() as db:
         initial = db.get(Task, task_id)
         if not initial or initial.status != "running":
@@ -80,17 +77,13 @@ def finish(sessions, task_id, reason, *, model_complete=False):
         if not batch or batch.payload["batch_version"] != task.input_data["expected_version"]:
             raise ValueError("解析输入版本已变化")
         files = owned_files(db, task, batch)
-        rules_id, model_id = snapshot_ids(task)
-        rules = db.get(TraceSnapshot, rules_id)
-        if rules is None:
-            rules = make_stage(db, task)
+        snapshot = db.get(TraceSnapshot, snapshot_id(task))
+        if snapshot is None:
+            snapshot = make_stage(db, task)
         expired = now_shanghai() >= task.created_at + STOP_AFTER
-        rules_complete = rules.payload.get("rules_complete", False)
-        candidate = db.get(TraceSnapshot, model_id) if model_complete and not expired else None
-        if candidate is not None and candidate.payload["parsed_count"] != rules.payload["parsed_count"]:
-            raise ValueError("模型审计结果未覆盖整批")
-        updates = rules.payload["file_updates"]
-        parsed = rules.payload["parsed_count"]
+        rules_complete = snapshot.payload.get("rules_complete", False)
+        updates = snapshot.payload["file_updates"]
+        parsed = snapshot.payload["parsed_count"]
         failed = sum(value["failed_record_count"] for value in updates.values())
         if reason == "rules_complete" and not parsed and failed:
             task.status = "failed"
@@ -98,13 +91,18 @@ def finish(sessions, task_id, reason, *, model_complete=False):
             for key, file in files.items():
                 file.payload = {**file.payload, **updates[key]}
         else:
-            snapshot = candidate if candidate is not None else rules
             stop_reason = "deadline" if expired else reason
-            snapshot.payload = {**snapshot.payload, "audit_completion": {
-                "mode": "rules_and_model" if candidate is not None else "rules",
+            model_completed = snapshot.payload.get("model_completed_trace_count", 0)
+            model_unavailable = snapshot.payload.get("model_unavailable_trace_count", 0)
+            completion = {
+                "mode": "rules_and_model" if model_completed else "rules",
                 "reason": stop_reason, "rules_complete": rules_complete,
                 "completed_trace_count": parsed,
-            }}
+                "model_completed_trace_count": model_completed,
+                "model_unavailable_trace_count": model_unavailable,
+                "model_unattempted_trace_count": parsed - model_completed - model_unavailable,
+            }
+            snapshot.payload = {**snapshot.payload, "audit_completion": completion}
             ingest.activate_snapshot(db, batch, snapshot)
             for key, file in files.items():
                 file.payload = {**file.payload, **updates.get(key, {"parse_status": "succeeded",
@@ -116,7 +114,7 @@ def finish(sessions, task_id, reason, *, model_complete=False):
                 "outcome": "partial" if failed or not rules_complete else "complete" if parsed else "empty",
                 "parsed_trace_count": parsed,
                 "failed_record_count": failed, "batch_version": batch.payload["batch_version"],
-                "file_count": len(files), "schema_version": "1"}
+                "file_count": len(files), "schema_version": "1", "audit_completion": completion}
         task.progress = 100
         task.finished_at = now_shanghai()
         db.commit()
@@ -178,54 +176,52 @@ def still_working(sessions, task_id):
         return bool(task and task.status == "running" and now_shanghai() < task.created_at + STOP_AFTER)
 
 
-def staged_projection(db, sid, row):
-    scope = {"snapshot_id": sid}
-    events = query.process_records(db, scope, row.trace_id, TraceEvent)
-    calls = query.process_records(db, scope, row.trace_id, TraceCall)
-    relations, evidence = ([record.payload for record in db.scalars(select(table).where(
-        table.snapshot_id == sid, table.trace_id == row.trace_id).order_by(table.id))]
-        for table in (TraceRelation, TraceEvidence))
-    return row.trace_id, row.payload, events, calls, relations, evidence
-
-
 def stage_model(sessions, task_id, first_order, config):
     if not config.endpoint:
         return "configuration_missing"
-    if not still_working(sessions, task_id):
-        raise AuditStopped
-    # Candidate construction does not hold the task lock needed to publish the baseline.
+    from app.services.agent_trace_statistics import statistics_sample
+
     with sessions() as db:
-        task = db.get(Task, task_id)
-        rules_id, model_id = snapshot_ids(task)
-        make_stage(db, task, model=True)
-        db.commit()
+        sid = snapshot_id(db.get(Task, task_id))
+    scope = {"snapshot_id": sid}
+    last_failure = None
 
     with model_audit.client() as transport:
         after = first_order - 1
         while still_working(sessions, task_id):
             with sessions() as db:
-                row = db.scalar(select(TraceSample).where(TraceSample.snapshot_id == rules_id,
+                row = db.scalar(select(TraceSample).where(TraceSample.snapshot_id == sid,
                                                           TraceSample.ingest_order > after)
                                 .order_by(TraceSample.ingest_order).limit(1))
                 if not row:
-                    return None
+                    return last_failure or "model_complete"
                 after = row.ingest_order
-                snapshot_sample = {**row.result, "language": row.language}
-                projection = staged_projection(db, rules_id, row)
-            trace, payload, events, calls, _, evidence = projection
-            metadata = model_audit.audit(transport, config, payload, events, calls,
-                                        record=snapshot_sample.get("source_record", {}),
+                events = query.process_records(db, scope, row.trace_id, TraceEvent)
+                calls = query.process_records(db, scope, row.trace_id, TraceCall)
+            metadata = model_audit.audit(transport, config, row.payload, events, calls,
+                                        record=row.result.get("source_record", {}),
                                         should_continue=lambda: still_working(sessions, task_id))
+            if metadata.get("reason") == "deadline":
+                raise AuditStopped
             if metadata.get("status") != "completed":
-                return metadata.get("reason", "model_unavailable")
-            apply_model_audit(payload, trace, metadata, events, evidence)
-            validate_process(payload, events, calls)
+                last_failure = metadata.get("reason", "model_unavailable")
+            evidence = []
+            apply_model_audit(row.payload, row.trace_id, metadata, events, evidence)
+            validate_process(row.payload, events, calls)
             with sessions() as db:
                 work_task(db, task_id)
-                candidate = db.get(TraceSnapshot, model_id)
-                ingest.store_prepared(db, model_id, snapshot_sample, after, projection, stage=True)
-                candidate.payload = {**candidate.payload, "sample_count": candidate.payload["sample_count"] + 1,
-                                     "parsed_count": candidate.payload["parsed_count"] + 1}
+                stored = db.get(TraceSample, row.id)
+                stored.payload = row.payload
+                if metadata.get("risk_detected"):
+                    db.merge(statistics_sample(stored))
+                for item in evidence:
+                    db.add(TraceEvidence(id=stable_id("row_", sid, row.trace_id, item["evidence_id"]),
+                                         snapshot_id=sid, trace_id=row.trace_id, event_id=item["event_id"],
+                                         projection_version=ingest.VERSION, payload=item))
+                snapshot = db.get(TraceSnapshot, sid)
+                count_key = ("model_completed_trace_count" if metadata["status"] == "completed"
+                             else "model_unavailable_trace_count")
+                snapshot.payload = {**snapshot.payload, count_key: snapshot.payload.get(count_key, 0) + 1}
                 db.commit()
     raise AuditStopped
 
@@ -255,18 +251,16 @@ def run_batch(task_id, sessions):
         db.commit()
     try:
         count, first = stage_rules(sessions, task_id)
-        reason, complete = "rules_complete", False
+        reason = "rules_complete"
         if provider and count:
             try:
                 reason = stage_model(sessions, task_id, first, model_audit.configuration(provider, model=model_name))
-                complete = reason is None
-                reason = reason or "model_complete"
             except AuditStopped:
                 raise
             except Exception:
                 LOGGER.warning("Trace model audit interrupted for task %s", task_id)
                 reason = "model_interrupted"
-        finish(sessions, task_id, reason, model_complete=complete)
+        finish(sessions, task_id, reason)
     except AuditStopped:
         finish(sessions, task_id, "deadline")
     except Exception:
