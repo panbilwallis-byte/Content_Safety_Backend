@@ -6,6 +6,7 @@ from uuid import uuid4
 import pytest
 
 from app.services.agent_trace_competition import analyze
+from app.services.agent_trace_submission import submission_rows
 from test_agent_traces import env, ROOT
 
 
@@ -217,7 +218,7 @@ def test_supplied_samples_end_to_end(env):
     assert rows[1]["results"]["C4"]["truncations"] == []
     issue = next(i for i in rows[4]["results"]["C5"]["issues"] if i["step_id"] == 18)
     assert issue["evidence"] == [{"message_index": 32, "step_id": 18, "quote": "...[truncated 2110 chars]"}]
-    assert all(row["analysis_version"] == "competition-v5" for row in rows[:-1])
+    assert all(set(row) == {"trajectory_id", "results"} for row in rows)
 
     reference_path = Path(os.getenv("SCORING_REFERENCE_PATH", str(Path(path).with_name("reference_answers.jsonl"))))
     if reference_path.is_file():
@@ -286,7 +287,7 @@ def test_reading_old_report_neither_reanalyzes_nor_upgrades_snapshot(env, tmp_pa
     response = env["client"].get(f"{ROOT}/batches/{bid}/competition-report", params={"snapshotId": sid})
     assert response.status_code == 200, response.text
     row = json.loads(response.json()["data"]["jsonl"].splitlines()[0])
-    assert row == previous["competition_report"]
+    assert row == submission_rows([previous["competition_report"]])[0]
     with env["sessions"]() as db:
         assert db.get(TraceBatch, bid).active_snapshot_id == sid
         assert db.scalar(select(func.count()).select_from(TraceSnapshot)) == count

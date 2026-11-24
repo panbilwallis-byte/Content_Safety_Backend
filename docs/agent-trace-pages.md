@@ -104,6 +104,26 @@ workspace 使用 `view=execution&include=options` 或 include=dashboard；列表
 
 ## 导出
 
+### 批次审计报告：JSONL 与可读 JSON
+
+“下载 submission.jsonl”和“下载可读版 JSON”共用
+`GET /compliance/agent-traces/batches/{batch_id}/competition-report` 返回的报告。
+前者保持每行一个 JSON 对象，后者保持两空格缩进的 JSON 数组；
+均包含当前固定快照的全部样本和最后一条 aggregate，不受弹窗中选中样本影响。
+
+报告输出字段与 `reference_answers.jsonl` 对齐：顶层仅保留 `trajectory_id`、`results`；
+样本包含 A1—C5，汇总包含 A4。B1 保留步骤、共享步骤和思考正文；B3 仅保留
+`step_id`、`risk_quote`、`evidence`；C1 调用仅保留步骤、工具名、参数和返回正文；
+C2 保留当前步骤、前次步骤和证据；C3 保留步骤、错误类型和证据；C5 保留来源子项、
+步骤、消息下标和证据。证据保留 `step_id`、可用的 `message_index` 和完整 `quote`。
+不输出内部版本、规则 ID、事件 ID、内部来源定位或 `first_risk_step`。
+工具计数的动态工具名、参数和返回正文中的任意 JSON 字段保持完整。
+缺失坐标和原文不补造；仅有元数据标志、没有位置或原文的截断记录保留为空对象。
+
+整理仅发生在输出阶段，不修改数据库中的原始报告、审计规则、证据或历史快照。
+分析版本仍保留在接口响应的 `analysis_version` 中，不写入下载文件。
+新版思维路径结果包的 `submission.json` 采用同一字段投影，与弹窗报告保持一致。
+
 沿用 agent_trace_export 任务、任务查询、下载票据及同源二进制下载。
 现在除 tools 外支持 ingest/statistics/execution，按页面协议验证 batch/filtered/sample 范围与内容。
 当前视图生成 JSON，结果包生成 ZIP，统计样本支持完整 JSON。除下述新版思维路径结果包外，ZIP 按请求包含标准化 JSON、离线HTML、证据索引、

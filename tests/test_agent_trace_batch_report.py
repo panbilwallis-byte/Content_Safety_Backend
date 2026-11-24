@@ -12,6 +12,7 @@ from app.core.auth import create_token
 from app.models.agent_traces import TraceBatch, TraceSample, TraceEvent, TraceCall, TraceEvidence, TraceSnapshot, TraceProjection
 from app.services import agent_trace_competition as competition, agent_trace_query as q, agent_trace_ingest as ingest
 from app.services.agent_trace_trajectory import EXAMPLE
+from app.services.agent_trace_submission import submission_rows
 
 
 MESSAGES = {"messages": [
@@ -44,7 +45,7 @@ def test_all_ordinary_formats_render_complete_frontend_sections(env, tmp_path, m
     monkeypatch.delenv("AGENT_TRACE_ENABLE_LEGACY_VALUE_SYNC", raising=False)
     bid, _ = upload(env, tmp_path, [record])
     result, aggregate = rows(fetch(env, bid))
-    assert result["report_kind"] == "ordinary"
+    assert set(result) == {"trajectory_id", "results"}
     assert set(result["results"]) == {"A1", "A2", "A3", "B1", "B2", "B3", "C1", "C2", "C3", "C4", "C5"}
     r = result["results"]
     assert r["A3"]["tool_calls"] == expected_calls
@@ -64,7 +65,7 @@ def test_all_ordinary_formats_render_complete_frontend_sections(env, tmp_path, m
     if record is LANGCHAIN:
         assert r["A1"]["input_tokens"] == "未提供"
         assert r["B1"]["segments"] == []
-        assert "message_index" not in r["C1"]["calls"][0]
+        assert set(r["C1"]["calls"][0]) == {"step_id", "tool_name", "arguments", "returns"}
     if record is EXAMPLE:
         assert result["trajectory_id"] == EXAMPLE["sample_id"]
         assert r["C4"]["completion"] is True
@@ -88,7 +89,7 @@ def test_mixed_report_is_snapshot_scoped_and_read_only(env, tmp_path, monkeypatc
     response = fetch(env, bid, snapshot_id=scope["snapshot_id"], page=2, trace_id="ignored-filter")
     result = rows(response)
     assert len(result) == 5
-    assert result[3] == original_scored
+    assert result[3] == submission_rows([original_scored])[0]
     assert result[-1]["results"]["A4"]["tool_calls"] == 4
     summary = env["client"].get(ROOT + "/workspace", params={"view": "execution", "include": "dashboard", **scope}).json()["data"]["tool_call_summary"]
     assert result[-1]["results"]["A4"]["tool_calls"] == summary["total_call_count"]
@@ -150,11 +151,12 @@ def test_risk_on_return_locates_request_and_non_tool_risk_has_no_fake_call(env, 
         assert result["results"]["B2"]["judgment"] == "有风险"
         assert result["results"]["B3"]["risks"][0]["risk_quote"] == "private text"
     tool_risk = results[0]["results"]["B3"]["risks"][0]
-    assert tool_risk["event_ordinal"] == 4 and tool_risk["step_id"] == 3
+    assert set(tool_risk) == {"step_id", "risk_quote", "evidence"}
+    assert tool_risk["step_id"] == 3
     assert tool_risk["step_id"] == results[0]["results"]["C1"]["calls"][0]["step_id"]
     non_tool_risk = results[1]["results"]["B3"]["risks"][0]
     assert "step_id" not in non_tool_risk
-    assert non_tool_risk["field"] == "events[1]"
+    assert set(non_tool_risk) == {"risk_quote", "evidence"}
 
 
 def test_report_permissions_empty_batch_and_pending_audit(env, tmp_path, monkeypatch):
@@ -183,7 +185,8 @@ def test_completion_and_explicit_truncation_preserve_missing_values(env, tmp_pat
     result = rows(fetch(env, bid))[0]["results"]
     assert result["A1"]["input_tokens"] == "未提供"
     assert result["C4"]["completion"] is None
-    assert result["C4"]["truncations"][0]["field"] == "metadata.record.is_truncated"
+    # The source records truncation, but has no step or original message quote.
+    assert result["C4"]["truncations"] == [{}]
 
 
 def test_full_chain_shared_task_api_can_read_more_than_one_page(env, monkeypatch):

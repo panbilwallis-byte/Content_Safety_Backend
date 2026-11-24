@@ -278,8 +278,9 @@ def report_rows(db, scope, user):
 
 def report(db, scope, user):
     from app.services.agent_trace_batch_report import VERSION as ORDINARY_VERSION
+    from app.services.agent_trace_submission import submission_rows
     _, rows = report_rows(db, scope, user)
     versions = {r.get("analysis_version", "competition-v1") for r in rows[:-1]}
-    return {"jsonl": "\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n",
+    return {"jsonl": "\n".join(json.dumps(r, ensure_ascii=False) for r in submission_rows(rows)) + "\n",
             "analysis_version": next(iter(versions)) if len(versions) == 1 else ORDINARY_VERSION,
             "notice": "基于固定快照的已保存原文与审计结果；普通轨迹步骤采用事件序号，缺失信息不补造；未命中不代表全面安全"}

@@ -10,6 +10,7 @@ from app.models.tables import SystemUser
 from app.models.agent_traces import TraceEvidence, TraceEvent
 from app.services import agent_trace_query as q
 from app.services.agent_trace_competition import NAMES, report_rows
+from app.services.agent_trace_submission import submission_rows
 from app.services.agent_trace_steps import plan
 
 VERSION = "execution-risk-package-v1"
@@ -146,6 +147,6 @@ def build(db, task):
         all_risks.append({"trajectory_id": identity, "B3": {"指标": ALL_METRIC, "risks": risks}})
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for name, document in (("submission.json", submission), ("first-risks.json", first), ("all-risks.json", all_risks)):
+        for name, document in (("submission.json", submission_rows(submission)), ("first-risks.json", first), ("all-risks.json", all_risks)):
             archive.writestr(name, (json.dumps(document, ensure_ascii=False, indent=2, allow_nan=False) + "\n").encode("utf-8"))
     return output.getvalue(), "agent-trace-execution.zip", "application/zip"
